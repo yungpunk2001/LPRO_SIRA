@@ -605,6 +605,11 @@ class AudioDataGenerator(Sequence):
     Cada elemento del DataFrame representa un archivo de audio completo, pero
     la red se entrena con los chunks extraidos de ese audio. Por eso un lote de
     4 audios puede convertirse internamente en decenas de muestras.
+
+    Si `balance_chunks=True`, el generador construye los lotes a partir de los
+    audios del split actual, manteniendo un numero similar de chunks por clase.
+    Esto evita data leakage porque nunca mezcla archivos de train, validation y
+    test entre si.
     """
 
     def __init__(
@@ -632,14 +637,16 @@ class AudioDataGenerator(Sequence):
         self.rng = np.random.default_rng(seed)
 
         valid_mask = self.df["num_chunks"] > 0 if "num_chunks" in self.df.columns else np.ones(len(self.df), dtype=bool)
-        self.class_row_indices = {
-            int(class_id): self.df.index[valid_mask & (self.df["target"] == class_id)].to_numpy()
-            for class_id in sorted(self.df["target"].unique())
-        }
+        self.class_row_indices = {}
+        for class_id in sorted(self.df["target"].unique()):
+            class_indices = self.df.index[valid_mask & (self.df["target"] == class_id)].to_numpy()
+            if len(class_indices) > 0:
+                self.class_row_indices[int(class_id)] = class_indices
 
         if self.balance_chunks and len(self.class_row_indices) < 2:
             raise RuntimeError(
-                "El balanceo por chunks requiere al menos dos clases con chunks validos."
+                "El balanceo por chunks requiere al menos dos clases con chunks validos "
+                "dentro del split de entrenamiento."
             )
 
         self.on_epoch_end()
@@ -830,6 +837,8 @@ class AudioDataGenerator(Sequence):
         """Baraja el orden de los audios al final de cada epoca."""
         if self.shuffle:
             self.rng.shuffle(self.indices)
+            for class_indices in self.class_row_indices.values():
+                self.rng.shuffle(class_indices)
 
 
 def build_cantarini_cnn_model(input_shape=INPUT_SHAPE):
@@ -1164,13 +1173,32 @@ if __name__ == "__main__":
     #    - train con augmentacion
     #    - validation sin augmentacion
     # -----------------------------------------------------------------------
+    train_sample_weights = class_sample_weights
+    if USE_BALANCED_CHUNK_BATCHES:
+        print(
+            "Balanceo de lotes por chunk activado en train "
+            f"({TRAIN_CHUNK_BATCH_SIZE} chunks objetivo por lote)."
+        )
+        if train_sample_weights is not None:
+            print(
+                "Aviso: se desactivan los class weights efectivos porque el generador "
+                "ya equilibra el numero de chunks por clase dentro de cada lote."
+            )
+            train_sample_weights = None
+    else:
+        print("Balanceo de lotes por chunk desactivado. El batch se construira por audios.")
+
+    effective_use_class_weights = train_sample_weights is not None
+
     train_gen = AudioDataGenerator(
         train_df,
         base_path=DATASET_DIR,
         batch_size=BATCH_SIZE,
         augment=USE_DATA_AUGMENTATION,
         shuffle=True,
-        sample_weights=class_sample_weights,
+        sample_weights=train_sample_weights,
+        balance_chunks=USE_BALANCED_CHUNK_BATCHES,
+        chunk_batch_size=TRAIN_CHUNK_BATCH_SIZE,
         seed=RANDOM_SEED,
     )
     val_gen = AudioDataGenerator(
@@ -1179,6 +1207,7 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
         augment=False,
         shuffle=False,
+        balance_chunks=False,
         seed=RANDOM_SEED,
     )
 
@@ -1256,6 +1285,9 @@ if __name__ == "__main__":
             f"Decision step (s): {CHUNK_STEP_S}",
             f"Feature representation: {FEATURE_REPRESENTATION}",
             f"Split stratify columns: {', '.join(SPLIT_STRATIFY_COLUMNS)}",
+            f"Balanced chunk batches: {USE_BALANCED_CHUNK_BATCHES}",
+            f"Train chunk batch size: {TRAIN_CHUNK_BATCH_SIZE}",
+            f"Effective class weights: {effective_use_class_weights}",
             f"Umbral de referencia: {best_threshold:.2f}",
             "",
             build_metrics_report_block("Validacion por chunk", val_metrics),
@@ -1288,9 +1320,12 @@ if __name__ == "__main__":
                     "labels": label_encoder.classes_.tolist(),
                     "output_mode": "chunk_probability",
                     "use_class_weights": USE_CLASS_WEIGHTS,
+                    "effective_use_class_weights": effective_use_class_weights,
                     "use_data_augmentation": USE_DATA_AUGMENTATION,
                     "use_frequency_normalization": USE_FREQUENCY_NORMALIZATION,
                     "use_threshold_analysis": USE_THRESHOLD_ANALYSIS,
+                    "use_balanced_chunk_batches": USE_BALANCED_CHUNK_BATCHES,
+                    "train_chunk_batch_size": TRAIN_CHUNK_BATCH_SIZE,
                     "notes": (
                         "La CNN produce una probabilidad por chunk. "
                         "Las decisiones binarias o el suavizado temporal deben implementarse "
