@@ -435,8 +435,83 @@ def compute_class_sample_weights_from_chunks(
     return weights, class_chunk_counts
 
 
+def get_path_source(path_value):
+    """
+    Extrae la fuente/dataset de un path tipo `raw/siren/audioset/audio.wav`.
+
+    En este proyecto suele corresponder al tercer componente de la ruta.
+    """
+    if pd.isna(path_value):
+        return "missing"
+
+    normalized_path = str(path_value).replace("\\", "/")
+    path_parts = [part for part in normalized_path.split("/") if part]
+
+    if len(path_parts) >= 3:
+        return path_parts[2]
+    if len(path_parts) >= 1:
+        return path_parts[-1]
+    return "missing"
+
+
+def enrich_metadata_columns(df):
+    """
+    Anade columnas auxiliares derivadas de `path` cuando el CSV no las incluye.
+
+    - `source`: dataset o procedencia del audio.
+    - `domain`: proxy del dominio acustico. Si no existe en metadata, se toma
+      igual que `source` para poder estratificar sin romper el script.
+    """
+    df_local = df.copy()
+
+    if "source" not in df_local.columns:
+        df_local["source"] = df_local["path"].apply(get_path_source)
+
+    if "domain" not in df_local.columns:
+        df_local["domain"] = df_local["source"]
+
+    return df_local
+
+
+def resolve_stratify_columns(df, requested_columns, fallback_columns=("label",)):
+    """
+    Devuelve las columnas de estratificacion realmente disponibles en el DataFrame.
+
+    Si alguna columna pedida no existe, se informa y se intenta usar una
+    alternativa razonable antes de abortar.
+    """
+    available_columns = [column for column in requested_columns if column in df.columns]
+    missing_columns = [column for column in requested_columns if column not in df.columns]
+
+    if missing_columns:
+        print(
+            "Aviso: faltan columnas de estratificacion en metadata: "
+            f"{', '.join(missing_columns)}"
+        )
+
+    if available_columns:
+        return tuple(available_columns)
+
+    fallback_available_columns = [
+        column for column in fallback_columns if column in df.columns
+    ]
+    if fallback_available_columns:
+        print(
+            "Aviso: se usaran columnas alternativas para estratificar: "
+            f"{', '.join(fallback_available_columns)}"
+        )
+        return tuple(fallback_available_columns)
+
+    raise RuntimeError(
+        "No hay columnas validas para estratificar los splits. "
+        "Revisa la metadata o la configuracion de SPLIT_STRATIFY_COLUMNS."
+    )
+
+
 def make_stratum_keys(df, columns):
     """Combina varias columnas categoricas en una clave de estratificacion."""
+    if not columns:
+        return pd.Series(["global"] * len(df), index=df.index)
     return df.loc[:, columns].fillna("missing").astype(str).agg("|".join, axis=1)
 
 
@@ -588,14 +663,23 @@ def print_split_diagnostics(split_name, df, stratify_columns=SPLIT_STRATIFY_COLU
     print(df["label"].value_counts())
     print("Distribucion por chunk (label):")
     print(df.groupby("label")["num_chunks"].sum())
-    print(f"Distribucion por audio ({', '.join(stratify_columns)}):")
-    print(df.groupby(list(stratify_columns)).size())
-    print(f"Distribucion por chunk ({', '.join(stratify_columns)}):")
-    print(df.groupby(list(stratify_columns))["num_chunks"].sum())
-    print("Top fuentes por audio:")
-    print(df["source"].value_counts().head(10))
-    print("Top fuentes por chunk:")
-    print(df.groupby("source")["num_chunks"].sum().sort_values(ascending=False).head(10))
+    available_stratify_columns = [
+        column for column in stratify_columns if column in df.columns
+    ]
+
+    if available_stratify_columns:
+        print(f"Distribucion por audio ({', '.join(available_stratify_columns)}):")
+        print(df.groupby(available_stratify_columns).size())
+        print(f"Distribucion por chunk ({', '.join(available_stratify_columns)}):")
+        print(df.groupby(available_stratify_columns)["num_chunks"].sum())
+    else:
+        print("No hay columnas adicionales disponibles para diagnostico estratificado.")
+
+    if "source" in df.columns:
+        print("Top fuentes por audio:")
+        print(df["source"].value_counts().head(10))
+        print("Top fuentes por chunk:")
+        print(df.groupby("source")["num_chunks"].sum().sort_values(ascending=False).head(10))
 
 
 class AudioDataGenerator(Sequence):
@@ -1101,6 +1185,12 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     print("Cargando metadata...")
     df_master = pd.read_csv(METADATA_PATH)
+    df_master = enrich_metadata_columns(df_master)
+    effective_split_stratify_columns = resolve_stratify_columns(
+        df_master,
+        SPLIT_STRATIFY_COLUMNS,
+        fallback_columns=("label", "source"),
+    )
 
     label_encoder = LabelEncoder()
     df_master["target"] = label_encoder.fit_transform(df_master["label"])
@@ -1108,13 +1198,13 @@ if __name__ == "__main__":
 
     print(
         "Generando splits agrupados y estratificados por: "
-        f"{', '.join(SPLIT_STRATIFY_COLUMNS)}"
+        f"{', '.join(effective_split_stratify_columns)}"
     )
     train_idx, temp_idx = grouped_stratified_split(
         df_master,
         group_col="grupo_seguro",
         test_size=0.3,
-        stratify_columns=SPLIT_STRATIFY_COLUMNS,
+        stratify_columns=effective_split_stratify_columns,
         random_state=RANDOM_SEED,
     )
 
@@ -1125,7 +1215,7 @@ if __name__ == "__main__":
         temp_df,
         group_col="grupo_seguro",
         test_size=0.5,
-        stratify_columns=SPLIT_STRATIFY_COLUMNS,
+        stratify_columns=effective_split_stratify_columns,
         random_state=RANDOM_SEED,
     )
 
@@ -1147,9 +1237,9 @@ if __name__ == "__main__":
     )
     print("Distribucion de clases en train:")
     print(train_df["label"].value_counts())
-    print_split_diagnostics("Train", train_df)
-    print_split_diagnostics("Validation", val_df)
-    print_split_diagnostics("Test", test_df)
+    print_split_diagnostics("Train", train_df, effective_split_stratify_columns)
+    print_split_diagnostics("Validation", val_df, effective_split_stratify_columns)
+    print_split_diagnostics("Test", test_df, effective_split_stratify_columns)
 
     # -----------------------------------------------------------------------
     # 2. Compensar opcionalmente el desbalance entre clases.
@@ -1284,7 +1374,7 @@ if __name__ == "__main__":
             f"Overlap (s): {OVERLAP_S}",
             f"Decision step (s): {CHUNK_STEP_S}",
             f"Feature representation: {FEATURE_REPRESENTATION}",
-            f"Split stratify columns: {', '.join(SPLIT_STRATIFY_COLUMNS)}",
+            f"Split stratify columns: {', '.join(effective_split_stratify_columns)}",
             f"Balanced chunk batches: {USE_BALANCED_CHUNK_BATCHES}",
             f"Train chunk batch size: {TRAIN_CHUNK_BATCH_SIZE}",
             f"Effective class weights: {effective_use_class_weights}",
@@ -1314,7 +1404,7 @@ if __name__ == "__main__":
                     "overlap_s": OVERLAP_S,
                     "decision_step_s": CHUNK_STEP_S,
                     "feature_representation": FEATURE_REPRESENTATION,
-                    "split_stratify_columns": list(SPLIT_STRATIFY_COLUMNS),
+                    "split_stratify_columns": list(effective_split_stratify_columns),
                     "conv_filters": list(CONV_FILTERS),
                     "dense_units": DENSE_UNITS,
                     "labels": label_encoder.classes_.tolist(),
