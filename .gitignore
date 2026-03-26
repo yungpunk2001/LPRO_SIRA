@@ -1,0 +1,6 @@
+*
+!.gitignore
+!DataSet Camilo y Daniela/
+DataSet Camilo y Daniela/*
+!DataSet Camilo y Daniela/entrenar_modelo_margin_3.py
+!DataSet Camilo y Daniela/piloto_micro.py
