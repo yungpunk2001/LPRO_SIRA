@@ -1,0 +1,682 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import sys
+from fractions import Fraction
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+import librosa
+import numpy as np
+import sounddevice as sd
+import tensorflow as tf
+from scipy.signal import resample_poly
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL_PATH = os.path.join(
+    SCRIPT_DIR,
+    "modelo_sirenas_margin_3_20260326_123144.keras",
+)
+
+SAMPLE_RATE = 16000
+CHUNK_LENGTH_S = 0.5
+OVERLAP_S = 0.0
+PAD_TO = 8192
+N_FFT = 1024
+HOP_LENGTH = 512
+WINDOW = "hamming"
+HPSS_MARGIN = 3.0
+FREQ_BINS = 359
+TIME_FRAMES = 17
+
+DEFAULT_FEATURE_REPRESENTATION = "harmonic"
+DEFAULT_SPECTROGRAM_NORMALIZATION = "frequency"
+REFERENCE_CHUNK_THRESHOLD = 0.5
+DEFAULT_DECISION_THRESHOLD = 0.7
+DEFAULT_LABELS = ["background", "siren"]
+EXPECTED_OUTPUT_MODE = "chunk_probability"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Captura audio de una tarjeta de entrada y clasifica cada chunk "
+            "de 0.5 s para detectar sirena usando el modelo de Keras."
+        )
+    )
+    parser.add_argument(
+        "--model-path",
+        default=DEFAULT_MODEL_PATH,
+        help="Ruta al archivo .keras del modelo.",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Muestra las entradas de audio disponibles y sale.",
+    )
+    parser.add_argument(
+        "--device-index",
+        type=int,
+        help="Indice del dispositivo de entrada a usar.",
+    )
+    parser.add_argument(
+        "--device-name",
+        help="Subcadena del nombre del dispositivo de entrada a usar.",
+    )
+    parser.add_argument(
+        "--channels",
+        type=int,
+        default=1,
+        help="Canales a capturar del dispositivo. Por defecto: 1.",
+    )
+    parser.add_argument(
+        "--capture-samplerate",
+        type=float,
+        help=(
+            "Frecuencia de captura del dispositivo. Si no se indica, se "
+            "intenta 16000 Hz y, si no es valido, se usa la frecuencia "
+            "por defecto del dispositivo."
+        ),
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        help=(
+            "Umbral binario por chunk. Si no se indica, se usa el valor "
+            "0.80 en este script."
+        ),
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        help="Procesa como mucho este numero de chunks y termina.",
+    )
+    return parser.parse_args()
+
+
+def derive_postprocessing_path(model_path: str) -> str:
+    base_path, _ = os.path.splitext(model_path)
+    return f"{base_path}_postprocesado.json"
+
+
+def finalize_runtime_config(runtime_config: dict) -> dict:
+    chunk_samples = int(runtime_config["chunk_length_s"] * runtime_config["sample_rate"])
+    step_samples = int(
+        (runtime_config["chunk_length_s"] - runtime_config["overlap_s"])
+        * runtime_config["sample_rate"]
+    )
+    if step_samples <= 0:
+        raise ValueError("El paso entre chunks debe ser mayor que cero.")
+
+    labels = runtime_config["labels"]
+    if len(labels) < 2:
+        labels = list(DEFAULT_LABELS)
+
+    runtime_config["labels"] = labels
+    runtime_config["negative_label"] = labels[0]
+    runtime_config["positive_label"] = labels[-1]
+    runtime_config["chunk_samples"] = chunk_samples
+    runtime_config["step_samples"] = step_samples
+    runtime_config["decision_step_s"] = step_samples / runtime_config["sample_rate"]
+    return runtime_config
+
+
+def load_runtime_config(model_path: str) -> tuple[dict, str | None]:
+    runtime_config = {
+        "sample_rate": SAMPLE_RATE,
+        "chunk_length_s": CHUNK_LENGTH_S,
+        "overlap_s": OVERLAP_S,
+        "hpss_margin": HPSS_MARGIN,
+        "feature_representation": DEFAULT_FEATURE_REPRESENTATION,
+        "spectrogram_normalization": DEFAULT_SPECTROGRAM_NORMALIZATION,
+        "chunk_threshold": REFERENCE_CHUNK_THRESHOLD,
+        "labels": list(DEFAULT_LABELS),
+        "output_mode": EXPECTED_OUTPUT_MODE,
+    }
+
+    config_path = derive_postprocessing_path(model_path)
+    if not os.path.exists(config_path):
+        return finalize_runtime_config(runtime_config), None
+
+    with open(config_path, "r", encoding="utf-8") as file_handle:
+        saved_config = json.load(file_handle)
+
+    runtime_config["chunk_length_s"] = float(
+        saved_config.get("chunk_length_s", runtime_config["chunk_length_s"])
+    )
+    runtime_config["overlap_s"] = float(
+        saved_config.get("overlap_s", runtime_config["overlap_s"])
+    )
+    runtime_config["chunk_threshold"] = float(
+        saved_config.get("recommended_chunk_threshold", runtime_config["chunk_threshold"])
+    )
+    runtime_config["feature_representation"] = saved_config.get(
+        "feature_representation",
+        runtime_config["feature_representation"],
+    )
+    runtime_config["spectrogram_normalization"] = saved_config.get(
+        "spectrogram_normalization",
+        runtime_config["spectrogram_normalization"],
+    )
+    runtime_config["labels"] = list(saved_config.get("labels", runtime_config["labels"]))
+    runtime_config["output_mode"] = saved_config.get("output_mode", runtime_config["output_mode"])
+
+    if "spectrogram_normalization" not in saved_config:
+        use_frequency_normalization = bool(saved_config.get("use_frequency_normalization", True))
+        runtime_config["spectrogram_normalization"] = (
+            "frequency" if use_frequency_normalization else "none"
+        )
+
+    return finalize_runtime_config(runtime_config), config_path
+
+
+def normalize_spectrogram(db_spectrogram: np.ndarray, mode: str) -> np.ndarray:
+    if mode == "frequency":
+        freq_mean = np.mean(db_spectrogram, axis=1, keepdims=True)
+        freq_std = np.std(db_spectrogram, axis=1, keepdims=True)
+        normalized = (db_spectrogram - freq_mean) / (freq_std + 1e-6)
+        return np.clip(normalized, -5.0, 5.0).astype(np.float32)
+
+    if mode == "minmax":
+        min_db = np.min(db_spectrogram)
+        max_db = np.max(db_spectrogram)
+        if max_db - min_db > 0:
+            normalized = (db_spectrogram - min_db) / (max_db - min_db)
+        else:
+            normalized = db_spectrogram - min_db
+        return normalized.astype(np.float32)
+
+    if mode == "none":
+        return db_spectrogram.astype(np.float32)
+
+    raise ValueError(
+        "La normalizacion del espectrograma debe ser 'frequency', 'minmax' o 'none'."
+    )
+
+
+def build_feature_tensor_from_stft(stft_matrix: np.ndarray, runtime_config: dict) -> np.ndarray:
+    full_sliced = stft_matrix[:FREQ_BINS, :TIME_FRAMES]
+    harmonic, _ = librosa.decompose.hpss(stft_matrix, margin=runtime_config["hpss_margin"])
+    harmonic_sliced = harmonic[:FREQ_BINS, :TIME_FRAMES]
+
+    full_db = librosa.amplitude_to_db(np.abs(full_sliced), ref=np.max)
+    harmonic_db = librosa.amplitude_to_db(np.abs(harmonic_sliced), ref=np.max)
+
+    normalization_mode = runtime_config["spectrogram_normalization"]
+    full_db = normalize_spectrogram(full_db, normalization_mode)
+    harmonic_db = normalize_spectrogram(harmonic_db, normalization_mode)
+
+    feature_representation = runtime_config["feature_representation"]
+    if feature_representation == "harmonic":
+        return np.expand_dims(harmonic_db, axis=-1).astype(np.float32)
+    if feature_representation == "full":
+        return np.expand_dims(full_db, axis=-1).astype(np.float32)
+    if feature_representation == "harmonic_full":
+        return np.stack([harmonic_db, full_db], axis=-1).astype(np.float32)
+
+    raise ValueError(
+        "feature_representation debe ser 'harmonic', 'full' o 'harmonic_full'."
+    )
+
+
+def extract_features_from_array(audio_chunk: np.ndarray, runtime_config: dict) -> np.ndarray:
+    chunk_samples = runtime_config["chunk_samples"]
+    audio_chunk = pad_or_trim(audio_chunk.astype(np.float32, copy=False), chunk_samples)
+    audio_chunk_padded = np.pad(audio_chunk, (0, PAD_TO - len(audio_chunk)))
+    stft = librosa.stft(
+        audio_chunk_padded,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        window=WINDOW,
+    )
+    return build_feature_tensor_from_stft(stft, runtime_config)
+
+
+def pad_or_trim(audio: np.ndarray, target_length: int) -> np.ndarray:
+    if len(audio) < target_length:
+        return np.pad(audio, (0, target_length - len(audio)))
+    if len(audio) > target_length:
+        return audio[:target_length]
+    return audio
+
+
+def load_model_for_inference(model_path: str) -> tf.keras.Model:
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"No se encontro el modelo: {model_path}")
+    return tf.keras.models.load_model(model_path, compile=False)
+
+
+def expected_feature_shape(runtime_config: dict) -> tuple[int, int, int]:
+    channels = 2 if runtime_config["feature_representation"] == "harmonic_full" else 1
+    return (FREQ_BINS, TIME_FRAMES, channels)
+
+
+def validate_model_against_runtime(model: tf.keras.Model, runtime_config: dict) -> None:
+    input_shape = tuple(model.input_shape[1:])
+    expected_shape = expected_feature_shape(runtime_config)
+    if input_shape != expected_shape:
+        raise ValueError(
+            "El modelo espera input_shape="
+            f"{input_shape}, pero el preprocesado produce {expected_shape}. "
+            "Revisa el JSON de postprocesado o el modelo cargado."
+        )
+
+    output_shape = tuple(model.output_shape)
+    if output_shape[-1] != 1:
+        raise ValueError(
+            "Se esperaba una salida escalar por chunk, pero el modelo devuelve "
+            f"{output_shape}."
+        )
+
+
+def predict_chunk_probability(model: tf.keras.Model, features: np.ndarray) -> float:
+    raw_prediction = np.asarray(model.predict(features[np.newaxis, ...], verbose=0))
+    flattened_prediction = raw_prediction.reshape(-1)
+
+    if flattened_prediction.size != 1:
+        raise ValueError(
+            "Se esperaba una unica probabilidad por chunk, "
+            f"pero el modelo devolvio una salida con shape {raw_prediction.shape}."
+        )
+
+    return float(flattened_prediction[0])
+
+
+def list_input_devices() -> tuple[list[dict], int | None]:
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+    default_input = None
+    if sd.default.device is not None:
+        default_input = sd.default.device[0]
+        if default_input is not None and default_input < 0:
+            default_input = None
+
+    input_devices = []
+    for index, device in enumerate(devices):
+        max_input_channels = int(device["max_input_channels"])
+        if max_input_channels <= 0:
+            continue
+
+        hostapi_index = int(device["hostapi"])
+        hostapi_name = (
+            hostapis[hostapi_index]["name"]
+            if 0 <= hostapi_index < len(hostapis)
+            else "desconocido"
+        )
+        input_devices.append(
+            {
+                "index": index,
+                "name": str(device["name"]),
+                "hostapi": hostapi_name,
+                "max_input_channels": max_input_channels,
+                "default_samplerate": float(device["default_samplerate"]),
+            }
+        )
+
+    return input_devices, default_input
+
+
+def print_input_devices(input_devices: list[dict], default_input: int | None) -> None:
+    if not input_devices:
+        print("No se han encontrado dispositivos de entrada.")
+        return
+
+    print("Dispositivos de entrada disponibles:\n")
+    for device in input_devices:
+        marker = " (default)" if device["index"] == default_input else ""
+        print(
+            "[{index}] {name} | hostapi={hostapi} | canales={channels} | "
+            "sr_defecto={samplerate:.0f}{marker}".format(
+                index=device["index"],
+                name=device["name"],
+                hostapi=device["hostapi"],
+                channels=device["max_input_channels"],
+                samplerate=device["default_samplerate"],
+                marker=marker,
+            )
+        )
+
+
+def prompt_for_device(input_devices: list[dict], default_input: int | None) -> int:
+    valid_indices = {device["index"] for device in input_devices}
+    if not valid_indices:
+        raise RuntimeError("No hay dispositivos de entrada disponibles.")
+
+    print_input_devices(input_devices, default_input)
+    default_prompt = default_input if default_input in valid_indices else sorted(valid_indices)[0]
+
+    while True:
+        raw_value = input(
+            f"\nSelecciona el indice del dispositivo [{default_prompt}]: "
+        ).strip()
+        if not raw_value:
+            return default_prompt
+
+        try:
+            chosen_index = int(raw_value)
+        except ValueError:
+            print("Debes escribir un numero entero.")
+            continue
+
+        if chosen_index in valid_indices:
+            return chosen_index
+
+        print("Indice no valido. Elige uno de la lista.")
+
+
+def resolve_device_index(
+    args: argparse.Namespace,
+    input_devices: list[dict],
+    default_input: int | None,
+) -> int:
+    valid_indices = {device["index"] for device in input_devices}
+    if not valid_indices:
+        raise RuntimeError("No hay dispositivos de entrada disponibles.")
+
+    if args.device_index is not None:
+        if args.device_index not in valid_indices:
+            raise ValueError(
+                f"El dispositivo {args.device_index} no es una entrada valida."
+            )
+        return args.device_index
+
+    if args.device_name:
+        matches = [
+            device
+            for device in input_devices
+            if args.device_name.lower() in device["name"].lower()
+        ]
+        if not matches:
+            raise ValueError(
+                f"No hay ninguna entrada que contenga '{args.device_name}'."
+            )
+        if len(matches) > 1:
+            matched_indices = ", ".join(str(device["index"]) for device in matches)
+            raise ValueError(
+                "La busqueda por nombre es ambigua. Coincide con indices: "
+                f"{matched_indices}."
+            )
+        return matches[0]["index"]
+
+    if sys.stdin.isatty():
+        return prompt_for_device(input_devices, default_input)
+
+    if default_input in valid_indices:
+        return default_input
+
+    return sorted(valid_indices)[0]
+
+
+def choose_capture_samplerate(
+    device_index: int,
+    channels: int,
+    target_samplerate: int,
+    requested_samplerate: float | None,
+) -> int:
+    if requested_samplerate is not None:
+        samplerate = int(round(requested_samplerate))
+        sd.check_input_settings(
+            device=device_index,
+            channels=channels,
+            samplerate=samplerate,
+            dtype="float32",
+        )
+        return samplerate
+
+    try:
+        sd.check_input_settings(
+            device=device_index,
+            channels=channels,
+            samplerate=target_samplerate,
+            dtype="float32",
+        )
+        return target_samplerate
+    except Exception:
+        device_info = sd.query_devices(device_index)
+        fallback_samplerate = int(round(float(device_info["default_samplerate"])))
+        sd.check_input_settings(
+            device=device_index,
+            channels=channels,
+            samplerate=fallback_samplerate,
+            dtype="float32",
+        )
+        return fallback_samplerate
+
+
+def mix_to_mono(block: np.ndarray) -> np.ndarray:
+    if block.ndim == 1:
+        return block.astype(np.float32, copy=False)
+    return np.mean(block, axis=1, dtype=np.float32)
+
+
+def resample_chunk(
+    audio_chunk: np.ndarray,
+    orig_sr: int,
+    target_sr: int,
+    target_length: int,
+) -> np.ndarray:
+    if orig_sr == target_sr:
+        return pad_or_trim(audio_chunk.astype(np.float32, copy=False), target_length)
+
+    ratio = Fraction(target_sr, orig_sr).limit_denominator()
+    resampled = resample_poly(audio_chunk, ratio.numerator, ratio.denominator).astype(
+        np.float32
+    )
+    return pad_or_trim(resampled, target_length)
+
+
+def build_stream_callback(audio_queue: queue.Queue) -> callable:
+    def audio_callback(indata, frames, time_info, status) -> None:
+        del frames, time_info
+        if status:
+            print(f"[audio] {status}", file=sys.stderr)
+        try:
+            audio_queue.put_nowait(indata.copy())
+        except queue.Full:
+            print(
+                "[audio] Cola llena; se descarta un bloque de entrada.",
+                file=sys.stderr,
+            )
+
+    return audio_callback
+
+
+def run_stream(
+    model: tf.keras.Model,
+    runtime_config: dict,
+    device_index: int,
+    capture_samplerate: int,
+    channels: int,
+    max_chunks: int | None,
+) -> None:
+    capture_chunk_samples = int(round(runtime_config["chunk_length_s"] * capture_samplerate))
+    capture_step_samples = int(round(runtime_config["decision_step_s"] * capture_samplerate))
+
+    if capture_chunk_samples <= 0 or capture_step_samples <= 0:
+        raise ValueError("La configuracion temporal de captura no es valida.")
+
+    audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=32)
+    audio_buffer = np.empty(0, dtype=np.float32)
+    chunk_index = 0
+
+    stream_callback = build_stream_callback(audio_queue)
+
+    with sd.InputStream(
+        device=device_index,
+        channels=channels,
+        samplerate=capture_samplerate,
+        blocksize=capture_step_samples,
+        dtype="float32",
+        callback=stream_callback,
+    ):
+        print("\nCaptura iniciada. Pulsa Ctrl+C para detener.\n")
+
+        while True:
+            block = audio_queue.get()
+            mono_block = mix_to_mono(block)
+            audio_buffer = np.concatenate([audio_buffer, mono_block])
+
+            while len(audio_buffer) >= capture_chunk_samples:
+                raw_chunk = audio_buffer[:capture_chunk_samples].copy()
+                audio_buffer = audio_buffer[capture_step_samples:]
+
+                model_chunk = resample_chunk(
+                    raw_chunk,
+                    orig_sr=capture_samplerate,
+                    target_sr=runtime_config["sample_rate"],
+                    target_length=runtime_config["chunk_samples"],
+                )
+                features = extract_features_from_array(model_chunk, runtime_config)
+                probability = predict_chunk_probability(model, features)
+
+                is_positive = probability >= runtime_config["chunk_threshold"]
+                label = (
+                    runtime_config["positive_label"]
+                    if is_positive
+                    else runtime_config["negative_label"]
+                )
+                chunk_start_s = chunk_index * runtime_config["decision_step_s"]
+                rms = float(np.sqrt(np.mean(np.square(model_chunk))))
+
+                print(
+                    "[{index:05d}] t={time:8.2f}s | p({positive})={prob:.3f} | "
+                    "decision={label} | rms={rms:.4f}".format(
+                        index=chunk_index + 1,
+                        time=chunk_start_s,
+                        positive=runtime_config["positive_label"],
+                        prob=probability,
+                        label=label,
+                        rms=rms,
+                    ),
+                    flush=True,
+                )
+
+                chunk_index += 1
+                if max_chunks is not None and chunk_index >= max_chunks:
+                    return
+
+
+def describe_runtime(
+    model_path: str,
+    config_path: str | None,
+    device_info: dict,
+    runtime_config: dict,
+    capture_samplerate: int,
+    channels: int,
+    model: tf.keras.Model,
+) -> None:
+    print(f"Modelo: {model_path}")
+    if config_path:
+        print(f"Postprocesado: {config_path}")
+    else:
+        print("Postprocesado: no encontrado; se usan valores por defecto del script.")
+
+    print(
+        "Input del modelo: {input_shape} | Output: {output_shape}".format(
+            input_shape=model.input_shape,
+            output_shape=model.output_shape,
+        )
+    )
+    print(
+        "Dispositivo [{index}]: {name} | hostapi={hostapi}".format(
+            index=device_info["index"],
+            name=device_info["name"],
+            hostapi=device_info["hostapi"],
+        )
+    )
+    print(
+        "Captura: {capture_sr} Hz, {channels} canal(es) | Modelo: {model_sr} Hz".format(
+            capture_sr=capture_samplerate,
+            channels=channels,
+            model_sr=runtime_config["sample_rate"],
+        )
+    )
+    print(
+        "Chunk: {chunk:.2f}s | Solape: {overlap:.2f}s | Paso: {step:.2f}s".format(
+            chunk=runtime_config["chunk_length_s"],
+            overlap=runtime_config["overlap_s"],
+            step=runtime_config["decision_step_s"],
+        )
+    )
+    print(
+        "Representacion: {representation} | Normalizacion: {normalization} | "
+        "Umbral: {threshold:.2f}".format(
+            representation=runtime_config["feature_representation"],
+            normalization=runtime_config["spectrogram_normalization"],
+            threshold=runtime_config["chunk_threshold"],
+        )
+    )
+    if runtime_config["output_mode"] != EXPECTED_OUTPUT_MODE:
+        print(
+            "Aviso: el JSON indica output_mode="
+            f"{runtime_config['output_mode']}. El script asumira una probabilidad "
+            "escalar por chunk."
+        )
+
+
+def main() -> None:
+    args = parse_args()
+
+    model_path = os.path.abspath(args.model_path)
+    runtime_config, config_path = load_runtime_config(model_path)
+    runtime_config["chunk_threshold"] = (
+        float(args.threshold)
+        if args.threshold is not None
+        else DEFAULT_DECISION_THRESHOLD
+    )
+
+    input_devices, default_input = list_input_devices()
+    if args.list_devices:
+        print_input_devices(input_devices, default_input)
+        return
+
+    device_index = resolve_device_index(args, input_devices, default_input)
+    device_lookup = {device["index"]: device for device in input_devices}
+    device_info = device_lookup[device_index]
+
+    if args.channels <= 0:
+        raise ValueError("--channels debe ser mayor que cero.")
+    if args.channels > device_info["max_input_channels"]:
+        raise ValueError(
+            "El dispositivo seleccionado solo admite "
+            f"{device_info['max_input_channels']} canal(es) de entrada."
+        )
+
+    capture_samplerate = choose_capture_samplerate(
+        device_index=device_index,
+        channels=args.channels,
+        target_samplerate=runtime_config["sample_rate"],
+        requested_samplerate=args.capture_samplerate,
+    )
+
+    model = load_model_for_inference(model_path)
+    validate_model_against_runtime(model, runtime_config)
+    describe_runtime(
+        model_path=model_path,
+        config_path=config_path,
+        device_info=device_info,
+        runtime_config=runtime_config,
+        capture_samplerate=capture_samplerate,
+        channels=args.channels,
+        model=model,
+    )
+
+    try:
+        run_stream(
+            model=model,
+            runtime_config=runtime_config,
+            device_index=device_index,
+            capture_samplerate=capture_samplerate,
+            channels=args.channels,
+            max_chunks=args.max_chunks,
+        )
+    except KeyboardInterrupt:
+        print("\nCaptura detenida por el usuario.")
+
+
+if __name__ == "__main__":
+    main()

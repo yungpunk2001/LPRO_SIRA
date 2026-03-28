@@ -7,7 +7,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from sklearn.metrics import average_precision_score, confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    fbeta_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.preprocessing import LabelEncoder
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.layers import (
@@ -22,6 +29,39 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.utils import Sequence, register_keras_serializable
+
+
+TRAINING_CONFIG_ENV_VAR = "SIREN_TRAINING_CONFIG_PATH"
+
+
+def load_runtime_config_overrides():
+    """
+    Carga overrides de configuracion desde un JSON opcional.
+
+    Esto permite lanzar el mismo script varias veces con ajustes distintos sin
+    editar manualmente el fichero principal entre experimentos.
+    """
+    config_path = os.environ.get(TRAINING_CONFIG_ENV_VAR)
+    if not config_path:
+        return {}, None
+
+    with open(config_path, "r", encoding="utf-8") as file_handle:
+        overrides = json.load(file_handle)
+
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            f"El fichero indicado en {TRAINING_CONFIG_ENV_VAR} debe contener un objeto JSON."
+        )
+
+    return overrides, config_path
+
+
+RUNTIME_CONFIG_OVERRIDES, RUNTIME_CONFIG_PATH = load_runtime_config_overrides()
+
+
+def get_config_value(name, default):
+    """Devuelve el valor sobrescrito desde JSON o el valor por defecto."""
+    return RUNTIME_CONFIG_OVERRIDES.get(name, default)
 
 
 # ---------------------------------------------------------------------------
@@ -42,70 +82,75 @@ from tensorflow.keras.utils import Sequence, register_keras_serializable
 # ---------------------------------------------------------------------------
 # Configuracion global del experimento
 # ---------------------------------------------------------------------------
-RANDOM_SEED = 42
-SAMPLE_RATE = 16000
-CHUNK_LENGTH_S = 0.5
-OVERLAP_S = 0.0
+RANDOM_SEED = int(get_config_value("RANDOM_SEED", 42))
+SAMPLE_RATE = int(get_config_value("SAMPLE_RATE", 16000))
+CHUNK_LENGTH_S = float(get_config_value("CHUNK_LENGTH_S", 0.5))
+OVERLAP_S = float(get_config_value("OVERLAP_S", 0.0))
 CHUNK_STEP_S = CHUNK_LENGTH_S - OVERLAP_S
-BATCH_SIZE = 4
-EPOCHS = 50
-THRESHOLD_GRID = np.linspace(0.10, 0.95, 18)
-TARGET_FALSE_ALARMS_PER_MIN = 1.0
+BATCH_SIZE = int(get_config_value("BATCH_SIZE", 4))
+EPOCHS = int(get_config_value("EPOCHS", 50))
+THRESHOLD_GRID = np.array(
+    get_config_value("THRESHOLD_GRID", np.linspace(0.10, 0.95, 18).tolist()),
+    dtype=np.float32,
+)
+TARGET_FALSE_ALARMS_PER_MIN = float(get_config_value("TARGET_FALSE_ALARMS_PER_MIN", 1.0))
 
 # ---------------------------------------------------------------------------
 # Opciones activables del entrenamiento y evaluacion
 # ---------------------------------------------------------------------------
 # Si es True, aplica pesos por clase para compensar desbalance en el entrenamiento.
 # Si el numero de audios por clase ya esta equilibrado, puede dejarse en False.
-USE_CLASS_WEIGHTS = False
+USE_CLASS_WEIGHTS = bool(get_config_value("USE_CLASS_WEIGHTS", False))
 
 # Si es True, aplica augmentacion a los chunks del conjunto de entrenamiento.
 # Sirve para que la red vea ejemplos mas variados y generalice mejor.
-USE_DATA_AUGMENTATION = False
+USE_DATA_AUGMENTATION = bool(get_config_value("USE_DATA_AUGMENTATION", False))
 
 # Controla que representacion espectral entra en la CNN:
 # - "harmonic": solo la componente armonica tras HPSS.
 # - "full": espectrograma completo sin separar armonica/percusiva.
 # - "harmonic_full": dos canales, uno armonico y otro completo.
-FEATURE_REPRESENTATION = "harmonic_full"
+FEATURE_REPRESENTATION = str(get_config_value("FEATURE_REPRESENTATION", "harmonic_full"))
 
 # Controla como se normaliza el espectrograma antes de entrar en la CNN:
 # - "frequency": normalizacion por banda de frecuencia (modo actual del proyecto).
 # - "minmax": replica la idea de Camilo, reescalando cada chunk a [0, 1].
 # - "none": no aplica normalizacion adicional.
-SPECTROGRAM_NORMALIZATION = "minmax"
+SPECTROGRAM_NORMALIZATION = str(get_config_value("SPECTROGRAM_NORMALIZATION", "minmax"))
 
 # Si es True, muestra las graficas de loss, precision, recall, AUC-PR y F1.
 # Puede desactivarse si se quiere ejecutar el script de forma mas automatizada.
-SHOW_TRAINING_PLOTS = True
+SHOW_TRAINING_PLOTS = bool(get_config_value("SHOW_TRAINING_PLOTS", True))
 
 # Si es True, busca un umbral de referencia para convertir probabilidades
 # en decisiones binarias solo con fines de analisis.
-USE_THRESHOLD_ANALYSIS = True
+USE_THRESHOLD_ANALYSIS = bool(get_config_value("USE_THRESHOLD_ANALYSIS", True))
 
 # Si es True, guarda un fichero JSON con la configuracion de salida del modelo.
 # Esto ayuda a documentar como debe integrarse la CNN en produccion.
-SAVE_POSTPROCESSING_CONFIG = True
+SAVE_POSTPROCESSING_CONFIG = bool(get_config_value("SAVE_POSTPROCESSING_CONFIG", True))
 
 # Si es True, guarda en un .txt las metricas y matrices de confusion de
 # validacion y test para poder reutilizarlas en la memoria del proyecto.
-SAVE_CONFUSION_REPORT = True
+SAVE_CONFUSION_REPORT = bool(get_config_value("SAVE_CONFUSION_REPORT", True))
 
 # Si es True, el generador de entrenamiento intenta construir lotes con el
 # mismo numero de chunks por clase. Solo se aplica a train, nunca a val/test.
-USE_BALANCED_CHUNK_BATCHES = True
+USE_BALANCED_CHUNK_BATCHES = bool(get_config_value("USE_BALANCED_CHUNK_BATCHES", True))
 
 # Numero objetivo de chunks por lote cuando se activa el balanceo anterior.
-TRAIN_CHUNK_BATCH_SIZE = 64
+TRAIN_CHUNK_BATCH_SIZE = int(get_config_value("TRAIN_CHUNK_BATCH_SIZE", 64))
 
 # Columnas usadas para que train/validation/test mantengan proporciones mas
 # comparables sin romper la agrupacion por `grupo_seguro`.
-SPLIT_STRATIFY_COLUMNS = ("label", "domain")
+SPLIT_STRATIFY_COLUMNS = tuple(
+    get_config_value("SPLIT_STRATIFY_COLUMNS", ["label", "domain"])
+)
 
 # La CNN se hace algo mas ancha que la version inicial para reducir
 # infraajuste, manteniendo un coste razonable para CPU.
-CONV_FILTERS = (16, 32, 64)
-DENSE_UNITS = 32
+CONV_FILTERS = tuple(get_config_value("CONV_FILTERS", [16, 32, 64]))
+DENSE_UNITS = int(get_config_value("DENSE_UNITS", 32))
 
 # ---------------------------------------------------------------------------
 # Paralelismo para exprimir mejor la CPU durante el entrenamiento.
@@ -118,11 +163,21 @@ DENSE_UNITS = 32
 # todos los cores a TensorFlow y dejar el generador en serie.
 # ---------------------------------------------------------------------------
 LOGICAL_CPU_COUNT = max(1, os.cpu_count() or 1)
-PYDATASET_WORKERS = max(1, min(8, LOGICAL_CPU_COUNT // 4))
-TF_INTER_OP_THREADS = 2 if LOGICAL_CPU_COUNT >= 8 else 1
-TF_INTRA_OP_THREADS = max(1, LOGICAL_CPU_COUNT - PYDATASET_WORKERS)
-PYDATASET_USE_MULTIPROCESSING = False
-PYDATASET_MAX_QUEUE_SIZE = max(10, PYDATASET_WORKERS * 4)
+PYDATASET_WORKERS = int(
+    get_config_value("PYDATASET_WORKERS", max(1, min(8, LOGICAL_CPU_COUNT // 4)))
+)
+TF_INTER_OP_THREADS = int(
+    get_config_value("TF_INTER_OP_THREADS", 2 if LOGICAL_CPU_COUNT >= 8 else 1)
+)
+TF_INTRA_OP_THREADS = int(
+    get_config_value("TF_INTRA_OP_THREADS", max(1, LOGICAL_CPU_COUNT - PYDATASET_WORKERS))
+)
+PYDATASET_USE_MULTIPROCESSING = bool(
+    get_config_value("PYDATASET_USE_MULTIPROCESSING", False)
+)
+PYDATASET_MAX_QUEUE_SIZE = int(
+    get_config_value("PYDATASET_MAX_QUEUE_SIZE", max(10, PYDATASET_WORKERS * 4))
+)
 
 
 def get_num_input_channels():
@@ -141,11 +196,13 @@ INPUT_SHAPE = (359, 17, get_num_input_channels())
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(SCRIPT_DIR, "dataset")
 METADATA_PATH = os.path.join(DATASET_DIR, "metadata", "master_index.csv")
+RUN_OUTPUT_DIR = os.path.normpath(str(get_config_value("RUN_OUTPUT_DIR", SCRIPT_DIR)))
+RUN_NAME_PREFIX = str(get_config_value("RUN_NAME_PREFIX", "modelo_sirenas_margin_3"))
 RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-RUN_BASENAME = f"modelo_sirenas_margin_3_{RUN_TIMESTAMP}"
-MODEL_PATH = os.path.join(SCRIPT_DIR, f"{RUN_BASENAME}.keras")
-POSTPROCESSING_PATH = os.path.join(SCRIPT_DIR, f"{RUN_BASENAME}_postprocesado.json")
-CONFUSION_REPORT_PATH = os.path.join(SCRIPT_DIR, f"{RUN_BASENAME}_matrices_confusion.txt")
+RUN_BASENAME = f"{RUN_NAME_PREFIX}_{RUN_TIMESTAMP}"
+MODEL_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}.keras")
+POSTPROCESSING_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}_postprocesado.json")
+CONFUSION_REPORT_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}_matrices_confusion.txt")
 
 
 def configure_tensorflow_cpu_runtime():
@@ -1143,6 +1200,7 @@ def compute_metrics(y_true, y_pred, y_score, chunk_step_s=CHUNK_STEP_S):
     precision = precision_score(y_true, y_pred, zero_division=0)
     recall = recall_score(y_true, y_pred, zero_division=0)
     f1 = f1_score(y_true, y_pred, zero_division=0)
+    f2 = fbeta_score(y_true, y_pred, beta=2, zero_division=0)
     auc_pr = average_precision_score(y_true, y_score) if len(np.unique(y_true)) > 1 else float("nan")
 
     negative_chunks = max(1, int(np.sum(y_true == 0)))
@@ -1152,6 +1210,7 @@ def compute_metrics(y_true, y_pred, y_score, chunk_step_s=CHUNK_STEP_S):
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
+        "f2": float(f2),
         "auc_pr": float(auc_pr),
         "false_alarms_per_min": float(false_alarms_per_min),
         "tn": int(tn),
@@ -1170,6 +1229,7 @@ def select_best_threshold(y_true, y_scores, target_false_alarms_per_min=TARGET_F
     - El modelo produce probabilidades por chunk.
     - Este umbral se usa solo como analisis auxiliar.
     - La decision final en produccion puede usar otra logica externa.
+    - La seleccion prioriza F2 para dar mas peso al recall que a la precision.
     """
     threshold_rows = []
 
@@ -1183,12 +1243,12 @@ def select_best_threshold(y_true, y_scores, target_false_alarms_per_min=TARGET_F
 
     if not allowed.empty:
         best_row = allowed.sort_values(
-            by=["f1", "recall", "precision", "threshold"],
+            by=["f2", "recall", "precision", "threshold"],
             ascending=[False, False, False, False],
         ).iloc[0]
     else:
         best_row = threshold_df.sort_values(
-            by=["false_alarms_per_min", "f1", "recall"],
+            by=["false_alarms_per_min", "f2", "recall"],
             ascending=[True, False, False],
         ).iloc[0]
 
@@ -1235,7 +1295,7 @@ def print_metrics_block(title, metrics):
     """Imprime un resumen compacto de metricas para validacion o test."""
     print(f"\n{title}")
     print(
-        "Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | "
+        "Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | F2: {f2:.4f} | "
         "AUC-PR: {auc_pr:.4f} | Falsas alarmas/min: {false_alarms_per_min:.2f}".format(**metrics)
     )
     print(
@@ -1252,7 +1312,7 @@ def build_metrics_report_block(title, metrics):
     lines = [
         title,
         (
-            "Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | "
+            "Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | F2: {f2:.4f} | "
             "AUC-PR: {auc_pr:.4f} | Falsas alarmas/min: {false_alarms_per_min:.2f}"
         ).format(**metrics),
         "Matriz de confusion [[TN, FP], [FN, TP]]:",
@@ -1265,7 +1325,13 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     # 1. Cargar metadata y construir los splits sin leakage.
     # -----------------------------------------------------------------------
+    os.makedirs(RUN_OUTPUT_DIR, exist_ok=True)
+
     print("Cargando metadata...")
+    if RUNTIME_CONFIG_PATH is not None:
+        print(f"Overrides de configuracion cargados desde: {RUNTIME_CONFIG_PATH}")
+        print(f"Claves sobrescritas: {', '.join(sorted(RUNTIME_CONFIG_OVERRIDES.keys()))}")
+
     df_master = pd.read_csv(METADATA_PATH)
     df_master = enrich_metadata_columns(df_master)
     effective_split_stratify_columns = resolve_stratify_columns(
@@ -1412,6 +1478,9 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     # 5. Evaluar la salida probabilistica por chunk en validacion y test.
     # -----------------------------------------------------------------------
+    val_metrics = None
+    test_metrics = None
+
     print("\nEvaluando la salida probabilistica por chunk sobre validacion...")
     val_y_true, val_y_scores = collect_chunk_predictions(model, val_df, DATASET_DIR)
     if USE_THRESHOLD_ANALYSIS:
@@ -1445,7 +1514,7 @@ if __name__ == "__main__":
         print_metrics_block("Test por chunk", test_metrics)
 
         threshold_summary = threshold_table[
-            ["threshold", "precision", "recall", "f1", "auc_pr", "false_alarms_per_min"]
+            ["threshold", "precision", "recall", "f1", "f2", "auc_pr", "false_alarms_per_min"]
         ]
         print("\nResumen de umbrales evaluados en validacion:")
         print(threshold_summary.to_string(index=False))
@@ -1504,6 +1573,8 @@ if __name__ == "__main__":
                     "split_stratify_columns": list(effective_split_stratify_columns),
                     "conv_filters": list(CONV_FILTERS),
                     "dense_units": DENSE_UNITS,
+                    "runtime_config_path": RUNTIME_CONFIG_PATH,
+                    "runtime_config_overrides": RUNTIME_CONFIG_OVERRIDES,
                     "labels": label_encoder.classes_.tolist(),
                     "output_mode": "chunk_probability",
                     "use_class_weights": USE_CLASS_WEIGHTS,
@@ -1519,6 +1590,9 @@ if __name__ == "__main__":
                     "pydataset_workers": PYDATASET_WORKERS,
                     "pydataset_use_multiprocessing": PYDATASET_USE_MULTIPROCESSING,
                     "pydataset_max_queue_size": PYDATASET_MAX_QUEUE_SIZE,
+                    "validation_metrics": val_metrics,
+                    "test_metrics": test_metrics,
+                    "threshold_selection_metric": "f2",
                     "notes": (
                         "La CNN produce una probabilidad por chunk. "
                         "Las decisiones binarias o el suavizado temporal deben implementarse "
