@@ -69,9 +69,11 @@ USE_DATA_AUGMENTATION = False
 # - "harmonic_full": dos canales, uno armonico y otro completo.
 FEATURE_REPRESENTATION = "harmonic_full"
 
-# Si es True, normaliza cada banda de frecuencia del espectrograma antes de
-# darselo a la CNN. Ayuda a reducir diferencias de nivel entre grabaciones.
-USE_FREQUENCY_NORMALIZATION = True
+# Controla como se normaliza el espectrograma antes de entrar en la CNN:
+# - "frequency": normalizacion por banda de frecuencia (modo actual del proyecto).
+# - "minmax": replica la idea de Camilo, reescalando cada chunk a [0, 1].
+# - "none": no aplica normalizacion adicional.
+SPECTROGRAM_NORMALIZATION = "minmax"
 
 # Si es True, muestra las graficas de loss, precision, recall, AUC-PR y F1.
 # Puede desactivarse si se quiere ejecutar el script de forma mas automatizada.
@@ -105,6 +107,23 @@ SPLIT_STRATIFY_COLUMNS = ("label", "domain")
 CONV_FILTERS = (16, 32, 64)
 DENSE_UNITS = 32
 
+# ---------------------------------------------------------------------------
+# Paralelismo para exprimir mejor la CPU durante el entrenamiento.
+#
+# En este proyecto hay dos focos de carga:
+# - TensorFlow: convoluciones, pooling y capas densas.
+# - Python/librosa: carga de audios, STFT, HPSS y construccion de batches.
+#
+# Como aqui se entrena en CPU, repartir los hilos suele rendir mejor que dar
+# todos los cores a TensorFlow y dejar el generador en serie.
+# ---------------------------------------------------------------------------
+LOGICAL_CPU_COUNT = max(1, os.cpu_count() or 1)
+PYDATASET_WORKERS = max(1, min(8, LOGICAL_CPU_COUNT // 4))
+TF_INTER_OP_THREADS = 2 if LOGICAL_CPU_COUNT >= 8 else 1
+TF_INTRA_OP_THREADS = max(1, LOGICAL_CPU_COUNT - PYDATASET_WORKERS)
+PYDATASET_USE_MULTIPROCESSING = False
+PYDATASET_MAX_QUEUE_SIZE = max(10, PYDATASET_WORKERS * 4)
+
 
 def get_num_input_channels():
     """Numero de canales de entrada segun la representacion espectral elegida."""
@@ -128,6 +147,42 @@ MODEL_PATH = os.path.join(SCRIPT_DIR, f"{RUN_BASENAME}.keras")
 POSTPROCESSING_PATH = os.path.join(SCRIPT_DIR, f"{RUN_BASENAME}_postprocesado.json")
 CONFUSION_REPORT_PATH = os.path.join(SCRIPT_DIR, f"{RUN_BASENAME}_matrices_confusion.txt")
 
+
+def configure_tensorflow_cpu_runtime():
+    """
+    Configura el reparto de hilos de TensorFlow antes de inicializar el runtime.
+
+    - intra_op: paralelismo dentro de operaciones grandes.
+    - inter_op: operaciones independientes ejecutandose en paralelo.
+    """
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(TF_INTRA_OP_THREADS)
+        tf.config.threading.set_inter_op_parallelism_threads(TF_INTER_OP_THREADS)
+    except RuntimeError as exc:
+        print(
+            "Aviso: no se ha podido fijar el paralelismo de TensorFlow porque "
+            f"el runtime ya estaba inicializado ({exc})."
+        )
+
+
+def print_parallelism_configuration():
+    """Muestra por pantalla como se reparte la CPU en este experimento."""
+    print(
+        "Configuracion de CPU -> hilos logicos: {logical} | "
+        "TF intra_op: {intra} | TF inter_op: {inter} | "
+        "PyDataset workers: {workers} | multiprocessing: {multiprocessing} | "
+        "cola maxima: {queue}".format(
+            logical=LOGICAL_CPU_COUNT,
+            intra=TF_INTRA_OP_THREADS,
+            inter=TF_INTER_OP_THREADS,
+            workers=PYDATASET_WORKERS,
+            multiprocessing=PYDATASET_USE_MULTIPROCESSING,
+            queue=PYDATASET_MAX_QUEUE_SIZE,
+        )
+    )
+
+
+configure_tensorflow_cpu_runtime()
 np.random.seed(RANDOM_SEED)
 tf.random.set_seed(RANDOM_SEED)
 
@@ -257,17 +312,35 @@ def augment_audio_chunk(audio_chunk, sr, rng):
     return augmented
 
 
-def normalize_spectrogram(db_spectrogram):
+def normalize_spectrogram(db_spectrogram, mode=SPECTROGRAM_NORMALIZATION):
     """
-    Normaliza cada banda de frecuencia del espectrograma.
+    Normaliza un espectrograma en dB segun la estrategia configurada.
 
-    Esto reduce diferencias de nivel entre grabaciones y ayuda a que la red
-    aprenda mas por patron espectral que por volumen absoluto.
+    - `frequency`: reduce diferencias de nivel entre grabaciones banda a banda.
+    - `minmax`: replica el reescalado [0, 1] del modelo compartido.
+    - `none`: conserva la escala en dB sin cambios extra.
     """
-    freq_mean = np.mean(db_spectrogram, axis=1, keepdims=True)
-    freq_std = np.std(db_spectrogram, axis=1, keepdims=True)
-    normalized = (db_spectrogram - freq_mean) / (freq_std + 1e-6)
-    return np.clip(normalized, -5.0, 5.0).astype(np.float32)
+    if mode == "frequency":
+        freq_mean = np.mean(db_spectrogram, axis=1, keepdims=True)
+        freq_std = np.std(db_spectrogram, axis=1, keepdims=True)
+        normalized = (db_spectrogram - freq_mean) / (freq_std + 1e-6)
+        return np.clip(normalized, -5.0, 5.0).astype(np.float32)
+
+    if mode == "minmax":
+        min_db = np.min(db_spectrogram)
+        max_db = np.max(db_spectrogram)
+        if max_db - min_db > 0:
+            normalized = (db_spectrogram - min_db) / (max_db - min_db)
+        else:
+            normalized = db_spectrogram - min_db
+        return normalized.astype(np.float32)
+
+    if mode == "none":
+        return db_spectrogram.astype(np.float32)
+
+    raise ValueError(
+        "SPECTROGRAM_NORMALIZATION debe ser 'frequency', 'minmax' o 'none'."
+    )
 
 
 def build_feature_tensor_from_stft(stft_matrix):
@@ -286,9 +359,8 @@ def build_feature_tensor_from_stft(stft_matrix):
     full_db = librosa.amplitude_to_db(np.abs(full_sliced), ref=np.max)
     harmonic_db = librosa.amplitude_to_db(np.abs(harmonic_sliced), ref=np.max)
 
-    if USE_FREQUENCY_NORMALIZATION:
-        full_db = normalize_spectrogram(full_db)
-        harmonic_db = normalize_spectrogram(harmonic_db)
+    full_db = normalize_spectrogram(full_db, mode=SPECTROGRAM_NORMALIZATION)
+    harmonic_db = normalize_spectrogram(harmonic_db, mode=SPECTROGRAM_NORMALIZATION)
 
     if FEATURE_REPRESENTATION == "harmonic":
         return np.expand_dims(harmonic_db, axis=-1)
@@ -707,8 +779,15 @@ class AudioDataGenerator(Sequence):
         balance_chunks=False,
         chunk_batch_size=TRAIN_CHUNK_BATCH_SIZE,
         seed=RANDOM_SEED,
+        dataset_workers=PYDATASET_WORKERS,
+        use_multiprocessing=PYDATASET_USE_MULTIPROCESSING,
+        max_queue_size=PYDATASET_MAX_QUEUE_SIZE,
     ):
-        super().__init__()
+        super().__init__(
+            workers=dataset_workers,
+            use_multiprocessing=use_multiprocessing,
+            max_queue_size=max_queue_size,
+        )
         self.df = df.reset_index(drop=True).copy()
         self.base_path = base_path
         self.batch_size = batch_size
@@ -719,6 +798,9 @@ class AudioDataGenerator(Sequence):
         self.chunk_batch_size = chunk_batch_size
         self.indices = np.arange(len(self.df))
         self.rng = np.random.default_rng(seed)
+        self.dataset_workers = dataset_workers
+        self.use_multiprocessing = use_multiprocessing
+        self.max_queue_size = max_queue_size
 
         valid_mask = self.df["num_chunks"] > 0 if "num_chunks" in self.df.columns else np.ones(len(self.df), dtype=bool)
         self.class_row_indices = {}
@@ -1235,6 +1317,7 @@ if __name__ == "__main__":
         f"Configuracion temporal -> chunk: {CHUNK_LENGTH_S:.2f} s | "
         f"solapamiento: {OVERLAP_S:.2f} s | paso entre decisiones: {CHUNK_STEP_S:.2f} s"
     )
+    print_parallelism_configuration()
     print("Distribucion de clases en train:")
     print(train_df["label"].value_counts())
     print_split_diagnostics("Train", train_df, effective_split_stratify_columns)
@@ -1290,6 +1373,9 @@ if __name__ == "__main__":
         balance_chunks=USE_BALANCED_CHUNK_BATCHES,
         chunk_batch_size=TRAIN_CHUNK_BATCH_SIZE,
         seed=RANDOM_SEED,
+        dataset_workers=PYDATASET_WORKERS,
+        use_multiprocessing=PYDATASET_USE_MULTIPROCESSING,
+        max_queue_size=PYDATASET_MAX_QUEUE_SIZE,
     )
     val_gen = AudioDataGenerator(
         val_df,
@@ -1299,6 +1385,9 @@ if __name__ == "__main__":
         shuffle=False,
         balance_chunks=False,
         seed=RANDOM_SEED,
+        dataset_workers=PYDATASET_WORKERS,
+        use_multiprocessing=PYDATASET_USE_MULTIPROCESSING,
+        max_queue_size=PYDATASET_MAX_QUEUE_SIZE,
     )
 
     # -----------------------------------------------------------------------
@@ -1374,10 +1463,17 @@ if __name__ == "__main__":
             f"Overlap (s): {OVERLAP_S}",
             f"Decision step (s): {CHUNK_STEP_S}",
             f"Feature representation: {FEATURE_REPRESENTATION}",
+            f"Spectrogram normalization: {SPECTROGRAM_NORMALIZATION}",
             f"Split stratify columns: {', '.join(effective_split_stratify_columns)}",
             f"Balanced chunk batches: {USE_BALANCED_CHUNK_BATCHES}",
             f"Train chunk batch size: {TRAIN_CHUNK_BATCH_SIZE}",
             f"Effective class weights: {effective_use_class_weights}",
+            f"Logical CPU count: {LOGICAL_CPU_COUNT}",
+            f"TF intra_op threads: {TF_INTRA_OP_THREADS}",
+            f"TF inter_op threads: {TF_INTER_OP_THREADS}",
+            f"PyDataset workers: {PYDATASET_WORKERS}",
+            f"PyDataset multiprocessing: {PYDATASET_USE_MULTIPROCESSING}",
+            f"PyDataset max queue size: {PYDATASET_MAX_QUEUE_SIZE}",
             f"Umbral de referencia: {best_threshold:.2f}",
             "",
             build_metrics_report_block("Validacion por chunk", val_metrics),
@@ -1404,6 +1500,7 @@ if __name__ == "__main__":
                     "overlap_s": OVERLAP_S,
                     "decision_step_s": CHUNK_STEP_S,
                     "feature_representation": FEATURE_REPRESENTATION,
+                    "spectrogram_normalization": SPECTROGRAM_NORMALIZATION,
                     "split_stratify_columns": list(effective_split_stratify_columns),
                     "conv_filters": list(CONV_FILTERS),
                     "dense_units": DENSE_UNITS,
@@ -1412,10 +1509,16 @@ if __name__ == "__main__":
                     "use_class_weights": USE_CLASS_WEIGHTS,
                     "effective_use_class_weights": effective_use_class_weights,
                     "use_data_augmentation": USE_DATA_AUGMENTATION,
-                    "use_frequency_normalization": USE_FREQUENCY_NORMALIZATION,
+                    "use_frequency_normalization": SPECTROGRAM_NORMALIZATION == "frequency",
                     "use_threshold_analysis": USE_THRESHOLD_ANALYSIS,
                     "use_balanced_chunk_batches": USE_BALANCED_CHUNK_BATCHES,
                     "train_chunk_batch_size": TRAIN_CHUNK_BATCH_SIZE,
+                    "logical_cpu_count": LOGICAL_CPU_COUNT,
+                    "tf_intra_op_threads": TF_INTRA_OP_THREADS,
+                    "tf_inter_op_threads": TF_INTER_OP_THREADS,
+                    "pydataset_workers": PYDATASET_WORKERS,
+                    "pydataset_use_multiprocessing": PYDATASET_USE_MULTIPROCESSING,
+                    "pydataset_max_queue_size": PYDATASET_MAX_QUEUE_SIZE,
                     "notes": (
                         "La CNN produce una probabilidad por chunk. "
                         "Las decisiones binarias o el suavizado temporal deben implementarse "

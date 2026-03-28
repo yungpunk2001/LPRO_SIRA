@@ -11,7 +11,7 @@ import tensorflow as tf
 # Configuracion base
 # =========================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(SCRIPT_DIR, "modelo_sirenas_margin_3.keras")
+MODEL_PATH = os.path.join(SCRIPT_DIR, "modelo_sirenas_margin_3_20260326_123144.keras")
 
 SAMPLE_RATE = 16000
 CHUNK_LENGTH_S = 0.5
@@ -24,7 +24,8 @@ HPSS_MARGIN = 3.0
 FREQ_BINS = 359
 TIME_FRAMES = 17
 
-USE_FREQUENCY_NORMALIZATION = True
+DEFAULT_FEATURE_REPRESENTATION = "harmonic"
+DEFAULT_SPECTROGRAM_NORMALIZATION = "frequency"
 REFERENCE_CHUNK_THRESHOLD = 0.5
 REFERENCE_HIT_RATIO = 0.25
 DEFAULT_LABELS = ["background", "siren"]
@@ -50,7 +51,8 @@ def load_runtime_config(model_path: str) -> tuple[dict, str | None]:
         "chunk_length_s": CHUNK_LENGTH_S,
         "overlap_s": OVERLAP_S,
         "hpss_margin": HPSS_MARGIN,
-        "use_frequency_normalization": USE_FREQUENCY_NORMALIZATION,
+        "feature_representation": DEFAULT_FEATURE_REPRESENTATION,
+        "spectrogram_normalization": DEFAULT_SPECTROGRAM_NORMALIZATION,
         "chunk_threshold": REFERENCE_CHUNK_THRESHOLD,
         "labels": list(DEFAULT_LABELS),
         "output_mode": EXPECTED_OUTPUT_MODE,
@@ -68,11 +70,25 @@ def load_runtime_config(model_path: str) -> tuple[dict, str | None]:
     runtime_config["chunk_threshold"] = float(
         saved_config.get("recommended_chunk_threshold", runtime_config["chunk_threshold"])
     )
+    runtime_config["feature_representation"] = saved_config.get(
+        "feature_representation",
+        runtime_config["feature_representation"],
+    )
+    runtime_config["spectrogram_normalization"] = saved_config.get(
+        "spectrogram_normalization",
+        runtime_config["spectrogram_normalization"],
+    )
     runtime_config["labels"] = list(saved_config.get("labels", runtime_config["labels"]))
     runtime_config["output_mode"] = saved_config.get("output_mode", runtime_config["output_mode"])
-    runtime_config["use_frequency_normalization"] = bool(
-        saved_config.get("use_frequency_normalization", runtime_config["use_frequency_normalization"])
-    )
+
+    # Compatibilidad con JSON antiguos que solo guardaban este booleano.
+    if "spectrogram_normalization" not in saved_config:
+        use_frequency_normalization = bool(
+            saved_config.get("use_frequency_normalization", True)
+        )
+        runtime_config["spectrogram_normalization"] = (
+            "frequency" if use_frequency_normalization else "none"
+        )
 
     return finalize_runtime_config(runtime_config), config_path
 
@@ -104,19 +120,67 @@ def record_audio(seconds: float, sr: int) -> np.ndarray:
     return audio.squeeze()
 
 
-def normalize_spectrogram(db_spectrogram: np.ndarray) -> np.ndarray:
+def normalize_spectrogram(
+    db_spectrogram: np.ndarray,
+    mode: str,
+) -> np.ndarray:
     """
-    Replica la normalizacion por banda activada en entrenar_modelo_margin_3.py.
+    Replica la estrategia de normalizacion guardada por el entrenamiento.
     """
-    freq_mean = np.mean(db_spectrogram, axis=1, keepdims=True)
-    freq_std = np.std(db_spectrogram, axis=1, keepdims=True)
-    normalized = (db_spectrogram - freq_mean) / (freq_std + 1e-6)
-    return np.clip(normalized, -5.0, 5.0).astype(np.float32)
+    if mode == "frequency":
+        freq_mean = np.mean(db_spectrogram, axis=1, keepdims=True)
+        freq_std = np.std(db_spectrogram, axis=1, keepdims=True)
+        normalized = (db_spectrogram - freq_mean) / (freq_std + 1e-6)
+        return np.clip(normalized, -5.0, 5.0).astype(np.float32)
+
+    if mode == "minmax":
+        min_db = np.min(db_spectrogram)
+        max_db = np.max(db_spectrogram)
+        if max_db - min_db > 0:
+            normalized = (db_spectrogram - min_db) / (max_db - min_db)
+        else:
+            normalized = db_spectrogram - min_db
+        return normalized.astype(np.float32)
+
+    if mode == "none":
+        return db_spectrogram.astype(np.float32)
+
+    raise ValueError(
+        "La normalizacion del espectrograma debe ser 'frequency', 'minmax' o 'none'."
+    )
+
+
+def build_feature_tensor_from_stft(stft: np.ndarray, runtime_config: dict) -> np.ndarray:
+    """
+    Construye la entrada final respetando la representacion usada al entrenar.
+    """
+    full_sliced = stft[:FREQ_BINS, :TIME_FRAMES]
+    harmonic, _ = librosa.decompose.hpss(stft, margin=runtime_config["hpss_margin"])
+    harmonic_sliced = harmonic[:FREQ_BINS, :TIME_FRAMES]
+
+    full_db = librosa.amplitude_to_db(np.abs(full_sliced), ref=np.max)
+    harmonic_db = librosa.amplitude_to_db(np.abs(harmonic_sliced), ref=np.max)
+
+    normalization_mode = runtime_config["spectrogram_normalization"]
+    full_db = normalize_spectrogram(full_db, normalization_mode)
+    harmonic_db = normalize_spectrogram(harmonic_db, normalization_mode)
+
+    feature_representation = runtime_config["feature_representation"]
+    if feature_representation == "harmonic":
+        return np.expand_dims(harmonic_db, axis=-1).astype(np.float32)
+    if feature_representation == "full":
+        return np.expand_dims(full_db, axis=-1).astype(np.float32)
+    if feature_representation == "harmonic_full":
+        return np.stack([harmonic_db, full_db], axis=-1).astype(np.float32)
+
+    raise ValueError(
+        "feature_representation debe ser 'harmonic', 'full' o 'harmonic_full'."
+    )
 
 
 def extract_features_from_array(audio_chunk: np.ndarray, runtime_config: dict) -> np.ndarray | None:
     """
-    Convierte un chunk mono en la entrada (359, 17, 1) usada por la CNN actual.
+    Convierte un chunk mono en la entrada exacta usada por la CNN entrenada.
     """
     chunk_samples = runtime_config["chunk_samples"]
 
@@ -128,15 +192,7 @@ def extract_features_from_array(audio_chunk: np.ndarray, runtime_config: dict) -
     audio_chunk = audio_chunk.astype(np.float32, copy=False)
     audio_chunk_padded = np.pad(audio_chunk, (0, PAD_TO - len(audio_chunk)))
     stft = librosa.stft(audio_chunk_padded, n_fft=N_FFT, hop_length=HOP_LENGTH, window=WINDOW)
-
-    harmonic, _ = librosa.decompose.hpss(stft, margin=runtime_config["hpss_margin"])
-    harmonic_sliced = harmonic[:FREQ_BINS, :TIME_FRAMES]
-
-    harmonic_db = librosa.amplitude_to_db(np.abs(harmonic_sliced), ref=np.max)
-    if runtime_config["use_frequency_normalization"]:
-        harmonic_db = normalize_spectrogram(harmonic_db)
-
-    return np.expand_dims(harmonic_db, axis=-1).astype(np.float32)
+    return build_feature_tensor_from_stft(stft, runtime_config)
 
 
 def sliding_chunks(audio: np.ndarray, runtime_config: dict) -> tuple[list[np.ndarray], list[float]]:
@@ -214,9 +270,12 @@ def main() -> None:
         )
     )
     print(
-        "Salida esperada: {output_mode} | Clase positiva: {positive_label}".format(
+        "Salida esperada: {output_mode} | Clase positiva: {positive_label} | "
+        "Representacion: {feature_representation} | Normalizacion: {normalization}".format(
             output_mode=runtime_config["output_mode"],
             positive_label=runtime_config["positive_label"],
+            feature_representation=runtime_config["feature_representation"],
+            normalization=runtime_config["spectrogram_normalization"],
         )
     )
     if runtime_config["output_mode"] != EXPECTED_OUTPUT_MODE:
