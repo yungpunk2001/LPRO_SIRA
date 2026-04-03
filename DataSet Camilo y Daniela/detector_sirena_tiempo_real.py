@@ -19,7 +19,7 @@ from scipy.signal import resample_poly
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_PATH = os.path.join(
     SCRIPT_DIR,
-    "modelo_sirenas_margin_3_20260326_123144.keras",
+    "modelo_sirenas_margin_3_20260328_200806.keras",
 )
 
 SAMPLE_RATE = 16000

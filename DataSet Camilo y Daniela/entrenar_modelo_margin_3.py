@@ -1343,6 +1343,15 @@ if __name__ == "__main__":
     label_encoder = LabelEncoder()
     df_master["target"] = label_encoder.fit_transform(df_master["label"])
     df_master["grupo_seguro"] = df_master["siren_id"].fillna(df_master["group_id"])
+    print("Contando chunks validos de todo el dataset. Esto puede tardar unos minutos...")
+    df_master = add_chunk_count_column(df_master, base_path=DATASET_DIR)
+
+    print(
+        f"Dataset completo -> audios: {len(df_master)} | "
+        f"chunks validos totales: {int(df_master['num_chunks'].sum())}"
+    )
+    print("Distribucion por chunk en el dataset completo:")
+    print(df_master.groupby("label")["num_chunks"].sum())
 
     print(
         "Generando splits agrupados y estratificados por: "
@@ -1370,14 +1379,13 @@ if __name__ == "__main__":
     val_df = temp_df.iloc[val_idx].reset_index(drop=True)
     test_df = temp_df.iloc[test_idx].reset_index(drop=True)
 
-    print("Contando chunks validos por split. Esto puede tardar unos minutos...")
-    train_df = add_chunk_count_column(train_df, base_path=DATASET_DIR)
-    val_df = add_chunk_count_column(val_df, base_path=DATASET_DIR)
-    test_df = add_chunk_count_column(test_df, base_path=DATASET_DIR)
-
     print(
         f"Archivos originales distribuidos en -> Train: {len(train_df)} | "
         f"Validation: {len(val_df)} | Test: {len(test_df)}"
+    )
+    print(
+        f"Chunks validos distribuidos en -> Train: {int(train_df['num_chunks'].sum())} | "
+        f"Validation: {int(val_df['num_chunks'].sum())} | Test: {int(test_df['num_chunks'].sum())}"
     )
     print(
         f"Configuracion temporal -> chunk: {CHUNK_LENGTH_S:.2f} s | "
