@@ -100,11 +100,16 @@ TARGET_FALSE_ALARMS_PER_MIN = float(get_config_value("TARGET_FALSE_ALARMS_PER_MI
 # ---------------------------------------------------------------------------
 # Si es True, aplica pesos por clase para compensar desbalance en el entrenamiento.
 # Si el numero de audios por clase ya esta equilibrado, puede dejarse en False.
-USE_CLASS_WEIGHTS = bool(get_config_value("USE_CLASS_WEIGHTS", False))
+USE_CLASS_WEIGHTS = bool(get_config_value("USE_CLASS_WEIGHTS", True))
 
 # Si es True, aplica augmentacion a los chunks del conjunto de entrenamiento.
 # Sirve para que la red vea ejemplos mas variados y generalice mejor.
-USE_DATA_AUGMENTATION = bool(get_config_value("USE_DATA_AUGMENTATION", False))
+USE_DATA_AUGMENTATION = bool(get_config_value("USE_DATA_AUGMENTATION", True))
+
+# Probabilidad de aplicar augmentacion a cada chunk cuando la opcion anterior
+# esta activada. El resto de chunks se usan originales para mezclar ejemplos
+# limpios y augmentados dentro del mismo entrenamiento.
+AUGMENTATION_APPLY_PROB = float(get_config_value("AUGMENTATION_APPLY_PROB", 0.5))
 
 # Controla que representacion espectral entra en la CNN:
 # - "harmonic": solo la componente armonica tras HPSS.
@@ -444,7 +449,8 @@ def extract_features_chunks(
 
     Flujo por chunk:
     1. Cortar una ventana temporal fija.
-    2. Aplicar augmentacion opcional si estamos en entrenamiento.
+    2. Aplicar augmentacion opcional si estamos en entrenamiento y el chunk
+       cae dentro de la probabilidad configurada.
     3. Calcular la STFT.
     4. Construir la representacion espectral elegida.
     5. Pasar a dB, normalizar y dar formato final.
@@ -464,8 +470,10 @@ def extract_features_chunks(
             if len(audio_chunk) < chunk_samples:
                 continue
 
-            # La augmentacion solo se usa durante entrenamiento.
-            if augment:
+            # La augmentacion solo se usa durante entrenamiento y se aplica
+            # con una probabilidad menor que 1 para mezclar chunks originales
+            # y chunks modificados on the fly.
+            if augment and rng.random() < AUGMENTATION_APPLY_PROB:
                 audio_chunk = augment_audio_chunk(audio_chunk, sr, rng)
 
             # Se rellena hasta 8192 muestras para obtener siempre 17 frames
@@ -1542,6 +1550,8 @@ if __name__ == "__main__":
             f"Feature representation: {FEATURE_REPRESENTATION}",
             f"Spectrogram normalization: {SPECTROGRAM_NORMALIZATION}",
             f"Split stratify columns: {', '.join(effective_split_stratify_columns)}",
+            f"Use data augmentation: {USE_DATA_AUGMENTATION}",
+            f"Augmentation apply probability: {AUGMENTATION_APPLY_PROB}",
             f"Balanced chunk batches: {USE_BALANCED_CHUNK_BATCHES}",
             f"Train chunk batch size: {TRAIN_CHUNK_BATCH_SIZE}",
             f"Effective class weights: {effective_use_class_weights}",
@@ -1588,6 +1598,7 @@ if __name__ == "__main__":
                     "use_class_weights": USE_CLASS_WEIGHTS,
                     "effective_use_class_weights": effective_use_class_weights,
                     "use_data_augmentation": USE_DATA_AUGMENTATION,
+                    "augmentation_apply_probability": AUGMENTATION_APPLY_PROB,
                     "use_frequency_normalization": SPECTROGRAM_NORMALIZATION == "frequency",
                     "use_threshold_analysis": USE_THRESHOLD_ANALYSIS,
                     "use_balanced_chunk_batches": USE_BALANCED_CHUNK_BATCHES,

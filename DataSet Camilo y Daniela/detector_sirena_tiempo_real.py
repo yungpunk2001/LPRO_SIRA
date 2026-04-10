@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import sys
 from fractions import Fraction
 
@@ -19,7 +20,7 @@ from scipy.signal import resample_poly
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_PATH = os.path.join(
     SCRIPT_DIR,
-    "modelo_sirenas_margin_3_20260328_200806.keras",
+    r"C:\Users\marti\Documents\UVigo\4_Cuarto\LPRO\Detección\DataSet Camilo y Daniela\Modelos Atlas\barrido_margin_3_20260406_205256\artefactos\exp_006_solo_espectrograma_completo_20260408_130621.keras",
 )
 
 SAMPLE_RATE = 16000
@@ -39,6 +40,12 @@ REFERENCE_CHUNK_THRESHOLD = 0.5
 DEFAULT_DECISION_THRESHOLD = 0.7
 DEFAULT_LABELS = ["background", "siren"]
 EXPECTED_OUTPUT_MODE = "chunk_probability"
+PREFERRED_HOSTAPIS = (
+    "Windows WASAPI",
+    "Windows DirectSound",
+    "MME",
+    "Windows WDM-KS",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,7 +78,18 @@ def parse_args() -> argparse.Namespace:
         "--channels",
         type=int,
         default=1,
-        help="Canales a capturar del dispositivo. Por defecto: 1.",
+        help=(
+            "Canales a abrir del dispositivo. Si eliges un canal N, el script "
+            "abrira al menos N+1 canales. Por defecto: 1."
+        ),
+    )
+    parser.add_argument(
+        "--device-channel",
+        type=int,
+        help=(
+            "Canal concreto del dispositivo que se analizara. Si no se indica, "
+            "se muestra una segunda pantalla para escogerlo."
+        ),
     )
     parser.add_argument(
         "--capture-samplerate",
@@ -87,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help=(
             "Umbral binario por chunk. Si no se indica, se usa el valor "
-            "0.80 en este script."
+            f"{DEFAULT_DECISION_THRESHOLD:.2f} en este script."
         ),
     )
     parser.add_argument(
@@ -341,6 +359,34 @@ def print_input_devices(input_devices: list[dict], default_input: int | None) ->
         )
 
 
+def print_device_channels(device_info: dict) -> None:
+    max_channels = int(device_info["max_input_channels"])
+
+    print(
+        "\nCanales disponibles para el dispositivo "
+        f"[{device_info['index']}] {device_info['name']}:\n"
+    )
+    for channel_index in range(max_channels):
+        print(f"[{channel_index}] Canal {channel_index}")
+
+    if max_channels == 6:
+        print(
+            "\nReferencia ReSpeaker XVF3800 USB (firmware 6ch, segun la wiki):\n"
+            "  canal 0 -> Audio procesado (Conference)\n"
+            "  canal 1 -> Audio procesado (ASR)\n"
+            "  canal 2 -> Mic 0 raw\n"
+            "  canal 3 -> Mic 1 raw\n"
+            "  canal 4 -> Mic 2 raw\n"
+            "  canal 5 -> Mic 3 raw"
+        )
+    elif max_channels == 2:
+        print(
+            "\nReferencia ReSpeaker XVF3800 USB (firmware 2ch, segun la wiki):\n"
+            "  canal 0 -> Audio procesado (Conference)\n"
+            "  canal 1 -> Audio procesado (ASR)"
+        )
+
+
 def prompt_for_device(input_devices: list[dict], default_input: int | None) -> int:
     valid_indices = {device["index"] for device in input_devices}
     if not valid_indices:
@@ -366,6 +412,27 @@ def prompt_for_device(input_devices: list[dict], default_input: int | None) -> i
             return chosen_index
 
         print("Indice no valido. Elige uno de la lista.")
+
+
+def prompt_for_channel(device_info: dict) -> int:
+    max_channels = int(device_info["max_input_channels"])
+    print_device_channels(device_info)
+
+    while True:
+        raw_value = input("\nSelecciona el canal del dispositivo [0]: ").strip()
+        if not raw_value:
+            return 0
+
+        try:
+            chosen_channel = int(raw_value)
+        except ValueError:
+            print("Debes escribir un numero entero.")
+            continue
+
+        if 0 <= chosen_channel < max_channels:
+            return chosen_channel
+
+        print(f"Canal no valido. Debe estar entre 0 y {max_channels - 1}.")
 
 
 def resolve_device_index(
@@ -411,9 +478,54 @@ def resolve_device_index(
     return sorted(valid_indices)[0]
 
 
+def resolve_device_channel(
+    args: argparse.Namespace,
+    device_info: dict,
+) -> int:
+    max_channels = int(device_info["max_input_channels"])
+
+    if args.device_channel is not None:
+        if not 0 <= args.device_channel < max_channels:
+            raise ValueError(
+                f"El canal {args.device_channel} no existe para este dispositivo."
+            )
+        return args.device_channel
+
+    if sys.stdin.isatty():
+        return prompt_for_channel(device_info)
+
+    return 0
+
+
+def canonical_device_name(device_name: str) -> str:
+    name = device_name.split("  (")[0].strip().lower()
+    name = re.sub(r"[^a-z0-9]+", " ", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def is_respeaker_device(device_info: dict) -> bool:
+    return "respeaker" in canonical_device_name(device_info["name"])
+
+
+def compute_stream_channels(
+    requested_channels: int,
+    device_info: dict,
+    device_channel: int,
+) -> int:
+    minimum_channels = max(requested_channels, device_channel + 1)
+
+    # Para arrays multicanal como ReSpeaker conviene abrir todo el bus USB y
+    # despues seleccionar el canal, para no depender de como PortAudio
+    # comprime o reindexa canales al abrir menos de los disponibles.
+    if is_respeaker_device(device_info) and int(device_info["max_input_channels"]) > 2:
+        return int(device_info["max_input_channels"])
+
+    return minimum_channels
+
+
 def choose_capture_samplerate(
     device_index: int,
-    channels: int,
+    stream_channels: int,
     target_samplerate: int,
     requested_samplerate: float | None,
 ) -> int:
@@ -421,7 +533,7 @@ def choose_capture_samplerate(
         samplerate = int(round(requested_samplerate))
         sd.check_input_settings(
             device=device_index,
-            channels=channels,
+            channels=stream_channels,
             samplerate=samplerate,
             dtype="float32",
         )
@@ -430,7 +542,7 @@ def choose_capture_samplerate(
     try:
         sd.check_input_settings(
             device=device_index,
-            channels=channels,
+            channels=stream_channels,
             samplerate=target_samplerate,
             dtype="float32",
         )
@@ -440,17 +552,127 @@ def choose_capture_samplerate(
         fallback_samplerate = int(round(float(device_info["default_samplerate"])))
         sd.check_input_settings(
             device=device_index,
-            channels=channels,
+            channels=stream_channels,
             samplerate=fallback_samplerate,
             dtype="float32",
         )
         return fallback_samplerate
 
 
-def mix_to_mono(block: np.ndarray) -> np.ndarray:
+def can_open_input_stream(
+    device_index: int,
+    stream_channels: int,
+    samplerate: int,
+    blocksize: int,
+) -> tuple[bool, str | None]:
+    def noop_callback(indata, frames, time_info, status) -> None:
+        del indata, frames, time_info, status
+
+    try:
+        with sd.InputStream(
+            device=device_index,
+            channels=stream_channels,
+            samplerate=samplerate,
+            blocksize=blocksize,
+            dtype="float32",
+            callback=noop_callback,
+        ):
+            sd.sleep(50)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def resolve_working_capture_device(
+    selected_device_info: dict,
+    input_devices: list[dict],
+    stream_channels: int,
+    requested_samplerate: float | None,
+    target_samplerate: int,
+    decision_step_s: float,
+) -> tuple[dict, int]:
+    selected_key = canonical_device_name(selected_device_info["name"])
+    selected_hostapi = selected_device_info["hostapi"]
+
+    alternative_devices = [
+        device
+        for device in input_devices
+        if canonical_device_name(device["name"]) == selected_key
+        and int(device["max_input_channels"]) >= stream_channels
+    ]
+
+    def hostapi_priority(device: dict) -> int:
+        try:
+            return PREFERRED_HOSTAPIS.index(device["hostapi"])
+        except ValueError:
+            return len(PREFERRED_HOSTAPIS)
+
+    alternative_devices.sort(
+        key=lambda device: (
+            0 if device["index"] == selected_device_info["index"] else 1,
+            hostapi_priority(device),
+            -int(device["max_input_channels"]),
+        )
+    )
+
+    errors = []
+    for device_info in alternative_devices:
+        try:
+            capture_samplerate = choose_capture_samplerate(
+                device_index=device_info["index"],
+                stream_channels=stream_channels,
+                target_samplerate=target_samplerate,
+                requested_samplerate=requested_samplerate,
+            )
+        except Exception as exc:
+            errors.append(
+                f"[{device_info['index']}] {device_info['name']} @ {device_info['hostapi']}: {exc}"
+            )
+            continue
+
+        capture_step_samples = int(round(decision_step_s * capture_samplerate))
+        can_open, error_message = can_open_input_stream(
+            device_index=device_info["index"],
+            stream_channels=stream_channels,
+            samplerate=capture_samplerate,
+            blocksize=capture_step_samples,
+        )
+        if can_open:
+            if device_info["index"] != selected_device_info["index"]:
+                print(
+                    "Aviso: la variante seleccionada en hostapi "
+                    f"{selected_hostapi} no se deja abrir con sounddevice. "
+                    f"Se usara [{device_info['index']}] {device_info['name']} "
+                    f"en {device_info['hostapi']}."
+                )
+            return device_info, capture_samplerate
+
+        errors.append(
+            f"[{device_info['index']}] {device_info['name']} @ {device_info['hostapi']}: "
+            f"{error_message}"
+        )
+
+    raise RuntimeError(
+        "No se ha podido abrir ninguna variante compatible del dispositivo.\n"
+        + "\n".join(errors)
+    )
+
+
+def select_input_channel(block: np.ndarray, device_channel: int) -> np.ndarray:
     if block.ndim == 1:
+        if device_channel != 0:
+            raise ValueError(
+                f"Solo se ha abierto 1 canal, asi que no se puede leer el canal {device_channel}."
+            )
         return block.astype(np.float32, copy=False)
-    return np.mean(block, axis=1, dtype=np.float32)
+
+    if device_channel >= block.shape[1]:
+        raise ValueError(
+            f"El bloque recibido tiene {block.shape[1]} canal(es), "
+            f"pero se ha pedido el canal {device_channel}."
+        )
+
+    return block[:, device_channel].astype(np.float32, copy=False)
 
 
 def resample_chunk(
@@ -490,7 +712,8 @@ def run_stream(
     runtime_config: dict,
     device_index: int,
     capture_samplerate: int,
-    channels: int,
+    stream_channels: int,
+    device_channel: int,
     max_chunks: int | None,
 ) -> None:
     capture_chunk_samples = int(round(runtime_config["chunk_length_s"] * capture_samplerate))
@@ -507,7 +730,7 @@ def run_stream(
 
     with sd.InputStream(
         device=device_index,
-        channels=channels,
+        channels=stream_channels,
         samplerate=capture_samplerate,
         blocksize=capture_step_samples,
         dtype="float32",
@@ -517,8 +740,8 @@ def run_stream(
 
         while True:
             block = audio_queue.get()
-            mono_block = mix_to_mono(block)
-            audio_buffer = np.concatenate([audio_buffer, mono_block])
+            selected_block = select_input_channel(block, device_channel)
+            audio_buffer = np.concatenate([audio_buffer, selected_block])
 
             while len(audio_buffer) >= capture_chunk_samples:
                 raw_chunk = audio_buffer[:capture_chunk_samples].copy()
@@ -566,7 +789,8 @@ def describe_runtime(
     device_info: dict,
     runtime_config: dict,
     capture_samplerate: int,
-    channels: int,
+    stream_channels: int,
+    device_channel: int,
     model: tf.keras.Model,
 ) -> None:
     print(f"Modelo: {model_path}")
@@ -589,9 +813,11 @@ def describe_runtime(
         )
     )
     print(
-        "Captura: {capture_sr} Hz, {channels} canal(es) | Modelo: {model_sr} Hz".format(
+        "Captura: {capture_sr} Hz, {stream_channels} canal(es) abiertos | "
+        "Canal analizado: {device_channel} | Modelo: {model_sr} Hz".format(
             capture_sr=capture_samplerate,
-            channels=channels,
+            stream_channels=stream_channels,
+            device_channel=device_channel,
             model_sr=runtime_config["sample_rate"],
         )
     )
@@ -637,21 +863,27 @@ def main() -> None:
     device_index = resolve_device_index(args, input_devices, default_input)
     device_lookup = {device["index"]: device for device in input_devices}
     device_info = device_lookup[device_index]
+    device_channel = resolve_device_channel(args, device_info)
 
     if args.channels <= 0:
         raise ValueError("--channels debe ser mayor que cero.")
-    if args.channels > device_info["max_input_channels"]:
+    stream_channels = compute_stream_channels(args.channels, device_info, device_channel)
+    if stream_channels > device_info["max_input_channels"]:
         raise ValueError(
             "El dispositivo seleccionado solo admite "
             f"{device_info['max_input_channels']} canal(es) de entrada."
         )
 
-    capture_samplerate = choose_capture_samplerate(
-        device_index=device_index,
-        channels=args.channels,
-        target_samplerate=runtime_config["sample_rate"],
+    selected_device_info, capture_samplerate = resolve_working_capture_device(
+        selected_device_info=device_info,
+        input_devices=input_devices,
+        stream_channels=stream_channels,
         requested_samplerate=args.capture_samplerate,
+        target_samplerate=runtime_config["sample_rate"],
+        decision_step_s=runtime_config["decision_step_s"],
     )
+    device_index = selected_device_info["index"]
+    device_info = selected_device_info
 
     model = load_model_for_inference(model_path)
     validate_model_against_runtime(model, runtime_config)
@@ -661,7 +893,8 @@ def main() -> None:
         device_info=device_info,
         runtime_config=runtime_config,
         capture_samplerate=capture_samplerate,
-        channels=args.channels,
+        stream_channels=stream_channels,
+        device_channel=device_channel,
         model=model,
     )
 
@@ -671,7 +904,8 @@ def main() -> None:
             runtime_config=runtime_config,
             device_index=device_index,
             capture_samplerate=capture_samplerate,
-            channels=args.channels,
+            stream_channels=stream_channels,
+            device_channel=device_channel,
             max_chunks=args.max_chunks,
         )
     except KeyboardInterrupt:
