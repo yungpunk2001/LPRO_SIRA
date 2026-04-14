@@ -69,7 +69,7 @@ def get_config_value(name, default):
 #
 # Idea general del pipeline:
 # 1. Leer cada audio y dividirlo en chunks de 0.5 s.
-# 2. Convertir cada chunk en un espectrograma armonico de tamano fijo.
+# 2. Convertir cada chunk en una representacion espectral de tamano fijo.
 # 3. Entrenar una CNN binaria para estimar la probabilidad de "sirena".
 # 4. Evaluar el modelo chunk a chunk con metricas utiles para deteccion.
 #
@@ -111,10 +111,62 @@ USE_DATA_AUGMENTATION = bool(get_config_value("USE_DATA_AUGMENTATION", True))
 # limpios y augmentados dentro del mismo entrenamiento.
 AUGMENTATION_APPLY_PROB = float(get_config_value("AUGMENTATION_APPLY_PROB", 0.5))
 
+# Si es True, permite aplicar una coloracion espectral suave para simular
+# cambios de microfono, colocacion o respuesta del habitaculo del coche.
+USE_SPECTRAL_EQ_AUGMENTATION = bool(
+    get_config_value("USE_SPECTRAL_EQ_AUGMENTATION", True)
+)
+
+# Probabilidad objetivo de aplicar la ecualizacion suave sobre el total de
+# chunks de entrenamiento cuando la augmentacion esta activada.
+EQ_AUGMENTATION_PROB = float(get_config_value("EQ_AUGMENTATION_PROB", 0.20))
+
+# Probabilidad de usar una sola curva de EQ. El resto de casos usa 2 curvas
+# anchas en zonas distintas del espectro.
+EQ_ONE_FILTER_PROB = float(get_config_value("EQ_ONE_FILTER_PROB", 0.70))
+
+# Ganancia maxima absoluta por shelf ancho.
+EQ_SHELF_GAIN_DB_MAX = float(get_config_value("EQ_SHELF_GAIN_DB_MAX", 3.0))
+
+# Ganancia maxima absoluta del bell cuando cae en la banda principal esperada
+# de la sirena. Se limita mas que los shelves por seguridad.
+EQ_BELL_GAIN_DB_MAX_SIREN_BAND = float(
+    get_config_value("EQ_BELL_GAIN_DB_MAX_SIREN_BAND", 2.0)
+)
+
+# Limite absoluto de la coloracion total acumulada tras sumar 1-2 curvas.
+EQ_TOTAL_GAIN_DB_LIMIT = float(get_config_value("EQ_TOTAL_GAIN_DB_LIMIT", 4.0))
+
+# Rangos de frecuencias de las curvas suaves usadas por la EQ.
+EQ_LOW_SHELF_CUTOFF_HZ_RANGE = tuple(
+    get_config_value("EQ_LOW_SHELF_CUTOFF_HZ_RANGE", [150.0, 500.0])
+)
+EQ_BELL_CENTER_HZ_RANGE = tuple(
+    get_config_value("EQ_BELL_CENTER_HZ_RANGE", [700.0, 2200.0])
+)
+EQ_HIGH_SHELF_CUTOFF_HZ_RANGE = tuple(
+    get_config_value("EQ_HIGH_SHELF_CUTOFF_HZ_RANGE", [2500.0, 6000.0])
+)
+
+# Anchura de las curvas: campanas amplias en octavas y transiciones suaves
+# para los shelves, evitando picos estrechos poco realistas.
+EQ_BELL_BANDWIDTH_OCTAVES_RANGE = tuple(
+    get_config_value("EQ_BELL_BANDWIDTH_OCTAVES_RANGE", [1.0, 1.8])
+)
+EQ_SHELF_SHARPNESS_RANGE = tuple(
+    get_config_value("EQ_SHELF_SHARPNESS_RANGE", [2.0, 3.0])
+)
+
+# Controla el frontend espectral usado por la CNN:
+# - "linear_stft": mantiene la representacion actual basada en STFT lineal.
+# - "log_mel": usa un log-mel espectrograma de un solo canal.
+SPECTRAL_FRONTEND = str(get_config_value("SPECTRAL_FRONTEND", "linear_stft"))
+
 # Controla que representacion espectral entra en la CNN:
 # - "harmonic": solo la componente armonica tras HPSS.
 # - "full": espectrograma completo sin separar armonica/percusiva.
 # - "harmonic_full": dos canales, uno armonico y otro completo.
+# Esta opcion solo afecta a `SPECTRAL_FRONTEND = "linear_stft"`.
 FEATURE_REPRESENTATION = str(get_config_value("FEATURE_REPRESENTATION", "harmonic_full"))
 
 # Controla como se normaliza el espectrograma antes de entrar en la CNN:
@@ -157,6 +209,13 @@ SPLIT_STRATIFY_COLUMNS = tuple(
 CONV_FILTERS = tuple(get_config_value("CONV_FILTERS", [16, 32, 64]))
 DENSE_UNITS = int(get_config_value("DENSE_UNITS", 32))
 
+# Parametros del frontend espectral.
+N_FFT = int(get_config_value("N_FFT", 1024))
+HOP_LENGTH = int(get_config_value("HOP_LENGTH", 512))
+LINEAR_FREQ_BINS = int(get_config_value("LINEAR_FREQ_BINS", 359))
+TIME_FRAMES = int(get_config_value("TIME_FRAMES", 17))
+MEL_BINS = int(get_config_value("MEL_BINS", 128))
+
 # ---------------------------------------------------------------------------
 # Paralelismo para exprimir mejor la CPU durante el entrenamiento.
 #
@@ -185,8 +244,8 @@ PYDATASET_MAX_QUEUE_SIZE = int(
 )
 
 
-def get_num_input_channels():
-    """Numero de canales de entrada segun la representacion espectral elegida."""
+def get_linear_num_input_channels():
+    """Numero de canales de entrada para el frontend STFT lineal."""
     if FEATURE_REPRESENTATION in {"harmonic", "full"}:
         return 1
     if FEATURE_REPRESENTATION == "harmonic_full":
@@ -196,7 +255,18 @@ def get_num_input_channels():
     )
 
 
-INPUT_SHAPE = (359, 17, get_num_input_channels())
+def get_input_shape():
+    """Forma de entrada de la CNN segun el frontend espectral configurado."""
+    if SPECTRAL_FRONTEND == "linear_stft":
+        return (LINEAR_FREQ_BINS, TIME_FRAMES, get_linear_num_input_channels())
+    if SPECTRAL_FRONTEND == "log_mel":
+        return (MEL_BINS, TIME_FRAMES, 1)
+    raise ValueError(
+        "SPECTRAL_FRONTEND debe ser 'linear_stft' o 'log_mel'."
+    )
+
+
+INPUT_SHAPE = get_input_shape()
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(SCRIPT_DIR, "dataset")
@@ -341,31 +411,156 @@ def apply_compression(audio, rng):
     return np.tanh(drive * audio).astype(np.float32)
 
 
+def build_low_shelf_curve_db(freqs_hz, cutoff_hz, gain_db, sharpness):
+    """Curva suave de low shelf en dB, sin transiciones estrechas."""
+    safe_freqs = np.maximum(freqs_hz, 1.0)
+    return gain_db / (1.0 + np.power(safe_freqs / max(cutoff_hz, 1.0), sharpness))
+
+
+def build_high_shelf_curve_db(freqs_hz, cutoff_hz, gain_db, sharpness):
+    """Curva suave de high shelf en dB, simetrica respecto al low shelf."""
+    safe_freqs = np.maximum(freqs_hz, 1.0)
+    low_component = 1.0 / (1.0 + np.power(safe_freqs / max(cutoff_hz, 1.0), sharpness))
+    return gain_db * (1.0 - low_component)
+
+
+def build_bell_curve_db(freqs_hz, center_hz, gain_db, bandwidth_octaves):
+    """Campana ancha en dominio log-frecuencia para evitar resonancias estrechas."""
+    safe_freqs = np.maximum(freqs_hz, 1.0)
+    log_distance = (
+        np.log2(safe_freqs) - np.log2(max(center_hz, 1.0))
+    ) / max(bandwidth_octaves, 1e-3)
+    return gain_db * np.exp(-0.5 * np.square(log_distance))
+
+
+def apply_random_spectral_eq(audio, sr, rng):
+    """
+    Aplica una coloracion espectral suave y controlada.
+
+    Reglas de seguridad aplicadas:
+    - probabilidad moderada
+    - 1 o 2 curvas maximo
+    - filtros anchos, nunca estrechos
+    - shelves limitados a +/-3 dB
+    - bell en banda principal de sirena limitado a +/-2 dB
+    - coloracion total final recortada a +/-4 dB acumulados
+    """
+    freqs_hz = np.fft.rfftfreq(len(audio), d=1.0 / sr)
+    total_curve_db = np.zeros_like(freqs_hz, dtype=np.float32)
+
+    num_filters = 1 if rng.random() < EQ_ONE_FILTER_PROB else 2
+    filter_types = rng.choice(
+        np.array(["low_shelf", "bell", "high_shelf"], dtype=object),
+        size=num_filters,
+        replace=False,
+    )
+
+    for filter_type in np.atleast_1d(filter_types):
+        if filter_type == "low_shelf":
+            cutoff_hz = rng.uniform(*EQ_LOW_SHELF_CUTOFF_HZ_RANGE)
+            gain_db = rng.uniform(-EQ_SHELF_GAIN_DB_MAX, EQ_SHELF_GAIN_DB_MAX)
+            sharpness = rng.uniform(*EQ_SHELF_SHARPNESS_RANGE)
+            curve_db = build_low_shelf_curve_db(freqs_hz, cutoff_hz, gain_db, sharpness)
+        elif filter_type == "high_shelf":
+            cutoff_hz = rng.uniform(*EQ_HIGH_SHELF_CUTOFF_HZ_RANGE)
+            gain_db = rng.uniform(-EQ_SHELF_GAIN_DB_MAX, EQ_SHELF_GAIN_DB_MAX)
+            sharpness = rng.uniform(*EQ_SHELF_SHARPNESS_RANGE)
+            curve_db = build_high_shelf_curve_db(freqs_hz, cutoff_hz, gain_db, sharpness)
+        else:
+            center_hz = rng.uniform(*EQ_BELL_CENTER_HZ_RANGE)
+            gain_db = rng.uniform(
+                -EQ_BELL_GAIN_DB_MAX_SIREN_BAND,
+                EQ_BELL_GAIN_DB_MAX_SIREN_BAND,
+            )
+            bandwidth_octaves = rng.uniform(*EQ_BELL_BANDWIDTH_OCTAVES_RANGE)
+            curve_db = build_bell_curve_db(
+                freqs_hz,
+                center_hz,
+                gain_db,
+                bandwidth_octaves,
+            )
+
+        total_curve_db += curve_db.astype(np.float32)
+
+    total_curve_db = np.clip(
+        total_curve_db,
+        -EQ_TOTAL_GAIN_DB_LIMIT,
+        EQ_TOTAL_GAIN_DB_LIMIT,
+    )
+
+    spectrum = np.fft.rfft(audio.astype(np.float32))
+    eq_gain = np.power(10.0, total_curve_db / 20.0).astype(np.float32)
+    equalized = np.fft.irfft(spectrum * eq_gain, n=len(audio)).astype(np.float32)
+
+    # La EQ debe cambiar el color espectral, no el nivel medio del chunk.
+    original_rms = np.sqrt(np.mean(np.square(audio)) + 1e-8)
+    equalized_rms = np.sqrt(np.mean(np.square(equalized)) + 1e-8)
+    equalized *= original_rms / max(equalized_rms, 1e-8)
+    return equalized.astype(np.float32)
+
+
+def get_effective_eq_apply_probability():
+    """
+    Ajusta la probabilidad condicionada de la EQ para respetar la probabilidad
+    objetivo sobre el total de chunks de entrenamiento.
+    """
+    if AUGMENTATION_APPLY_PROB <= 0.0:
+        return 0.0
+    return min(1.0, EQ_AUGMENTATION_PROB / AUGMENTATION_APPLY_PROB)
+
+
 def augment_audio_chunk(audio_chunk, sr, rng):
     """
     Crea variaciones realistas de un chunk solo para entrenamiento.
 
     La idea es exponer la red a pequenas variaciones de volumen, ruido,
     reverberacion y afinacion para que generalice mejor fuera del dataset.
+
+    Orden aplicado:
+    1. Ganancia
+    2. Time stretch
+    3. Pitch shift (solo con frontend STFT lineal)
+    4. Compresion/saturacion ligera
+    5. Reverb
+    6. Ruido
+    7. EQ suave
+
+    Este orden intenta separar:
+    - cambios de la fuente o de la senal base
+    - propagacion/reflexiones
+    - mezcla con el entorno
+    - coloracion final de canal/captura
+
+    Nota:
+    - El `pitch_shift` solo se aplica con `linear_stft`.
+    - Con `log_mel` se desactiva para no mezclar la invariancia propia del
+      frontend logaritmico con una perturbacion extra del tono.
+    - La EQ suave se usa como simulacion de coloracion de canal, no como efecto
+      creativo, y se limita para no superar +/-4 dB acumulados.
     """
     augmented = np.copy(audio_chunk).astype(np.float32)
 
     if rng.random() < 0.8:
         augmented *= rng.uniform(0.75, 1.25)
-    if rng.random() < 0.35:
-        augmented = add_shaped_noise(augmented, rng)
     if rng.random() < 0.20:
         augmented = librosa.effects.time_stretch(augmented, rate=rng.uniform(0.97, 1.03))
-    if rng.random() < 0.20:
+    if SPECTRAL_FRONTEND == "linear_stft" and rng.random() < 0.20:
         augmented = librosa.effects.pitch_shift(
             augmented,
             sr=sr,
             n_steps=rng.uniform(-0.35, 0.35),
         )
     if rng.random() < 0.20:
-        augmented = add_reverb(augmented, rng)
-    if rng.random() < 0.20:
         augmented = apply_compression(augmented, rng)
+    if rng.random() < 0.20:
+        augmented = add_reverb(augmented, rng)
+    if rng.random() < 0.35:
+        augmented = add_shaped_noise(augmented, rng)
+    if (
+        USE_SPECTRAL_EQ_AUGMENTATION
+        and rng.random() < get_effective_eq_apply_probability()
+    ):
+        augmented = apply_random_spectral_eq(augmented, sr, rng)
 
     augmented = pad_or_trim(augmented, len(audio_chunk)).astype(np.float32)
     peak = np.max(np.abs(augmented))
@@ -405,18 +600,28 @@ def normalize_spectrogram(db_spectrogram, mode=SPECTROGRAM_NORMALIZATION):
     )
 
 
-def build_feature_tensor_from_stft(stft_matrix):
+def pad_or_trim_time_frames(feature_map, target_frames=TIME_FRAMES):
+    """Ajusta el numero de frames temporales de una representacion 2D."""
+    current_frames = feature_map.shape[1]
+    if current_frames < target_frames:
+        return np.pad(feature_map, ((0, 0), (0, target_frames - current_frames)))
+    if current_frames > target_frames:
+        return feature_map[:, :target_frames]
+    return feature_map
+
+
+def build_feature_tensor_from_linear_stft(stft_matrix):
     """
-    Construye la entrada final de la CNN a partir de una STFT.
+    Construye la entrada final de la CNN a partir de una STFT lineal.
 
     Segun `FEATURE_REPRESENTATION`, devuelve:
     - un canal armonico
     - un canal completo
     - o ambos canales apilados
     """
-    full_sliced = stft_matrix[:359, :17]
+    full_sliced = stft_matrix[:LINEAR_FREQ_BINS, :TIME_FRAMES]
     harmonic, _ = librosa.decompose.hpss(stft_matrix, margin=3.0)
-    harmonic_sliced = harmonic[:359, :17]
+    harmonic_sliced = harmonic[:LINEAR_FREQ_BINS, :TIME_FRAMES]
 
     full_db = librosa.amplitude_to_db(np.abs(full_sliced), ref=np.max)
     harmonic_db = librosa.amplitude_to_db(np.abs(harmonic_sliced), ref=np.max)
@@ -436,6 +641,42 @@ def build_feature_tensor_from_stft(stft_matrix):
     )
 
 
+def build_feature_tensor_from_audio_chunk(audio_chunk_padded, sr=SAMPLE_RATE):
+    """
+    Construye la entrada final de la CNN a partir de un chunk de audio.
+
+    Segun `SPECTRAL_FRONTEND`, puede devolver:
+    - una representacion STFT lineal (actual del proyecto)
+    - un log-mel espectrograma de un solo canal
+    """
+    if SPECTRAL_FRONTEND == "linear_stft":
+        stft = librosa.stft(
+            audio_chunk_padded,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH,
+            window="hamming",
+        )
+        return build_feature_tensor_from_linear_stft(stft)
+
+    if SPECTRAL_FRONTEND == "log_mel":
+        mel_spectrogram = librosa.feature.melspectrogram(
+            y=audio_chunk_padded,
+            sr=sr,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH,
+            n_mels=MEL_BINS,
+            power=2.0,
+        )
+        mel_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
+        mel_db = pad_or_trim_time_frames(mel_db, target_frames=TIME_FRAMES)
+        mel_db = normalize_spectrogram(mel_db, mode=SPECTROGRAM_NORMALIZATION)
+        return np.expand_dims(mel_db, axis=-1).astype(np.float32)
+
+    raise ValueError(
+        "SPECTRAL_FRONTEND debe ser 'linear_stft' o 'log_mel'."
+    )
+
+
 def extract_features_chunks(
     audio_path,
     sr=SAMPLE_RATE,
@@ -451,8 +692,8 @@ def extract_features_chunks(
     1. Cortar una ventana temporal fija.
     2. Aplicar augmentacion opcional si estamos en entrenamiento y el chunk
        cae dentro de la probabilidad configurada.
-    3. Calcular la STFT.
-    4. Construir la representacion espectral elegida.
+    3. Calcular el frontend espectral elegido.
+    4. Construir la representacion final para la CNN.
     5. Pasar a dB, normalizar y dar formato final.
     """
     rng = rng if rng is not None else np.random.default_rng()
@@ -476,13 +717,12 @@ def extract_features_chunks(
             if augment and rng.random() < AUGMENTATION_APPLY_PROB:
                 audio_chunk = augment_audio_chunk(audio_chunk, sr, rng)
 
-            # Se rellena hasta 8192 muestras para obtener siempre 17 frames
-            # temporales al aplicar la STFT con estos parametros.
+            # Se rellena hasta 8192 muestras para obtener siempre TIME_FRAMES
+            # temporales al aplicar el frontend espectral con estos parametros.
             audio_chunk_padded = np.pad(audio_chunk, (0, 8192 - len(audio_chunk)))
-            stft = librosa.stft(audio_chunk_padded, n_fft=1024, hop_length=512, window="hamming")
 
-            # A partir de la STFT se genera la entrada final para la CNN.
-            features = build_feature_tensor_from_stft(stft)
+            # A partir del chunk temporal se genera la entrada final para la CNN.
+            features = build_feature_tensor_from_audio_chunk(audio_chunk_padded, sr=sr)
             chunks.append(features)
 
         return np.asarray(chunks, dtype=np.float32)
@@ -1547,11 +1787,35 @@ if __name__ == "__main__":
             f"Chunk length (s): {CHUNK_LENGTH_S}",
             f"Overlap (s): {OVERLAP_S}",
             f"Decision step (s): {CHUNK_STEP_S}",
+            f"Spectral frontend: {SPECTRAL_FRONTEND}",
             f"Feature representation: {FEATURE_REPRESENTATION}",
             f"Spectrogram normalization: {SPECTROGRAM_NORMALIZATION}",
+            f"N_FFT: {N_FFT}",
+            f"HOP_LENGTH: {HOP_LENGTH}",
+            f"Linear freq bins: {LINEAR_FREQ_BINS}",
+            f"Time frames: {TIME_FRAMES}",
+            f"Mel bins: {MEL_BINS}",
             f"Split stratify columns: {', '.join(effective_split_stratify_columns)}",
             f"Use data augmentation: {USE_DATA_AUGMENTATION}",
             f"Augmentation apply probability: {AUGMENTATION_APPLY_PROB}",
+            f"Use spectral EQ augmentation: {USE_SPECTRAL_EQ_AUGMENTATION}",
+            f"EQ augmentation target probability: {EQ_AUGMENTATION_PROB}",
+            "EQ augmentation effective conditional probability: "
+            f"{get_effective_eq_apply_probability():.4f}",
+            f"EQ one-filter probability: {EQ_ONE_FILTER_PROB}",
+            f"EQ shelf gain max (dB): +/-{EQ_SHELF_GAIN_DB_MAX}",
+            f"EQ bell gain max in siren band (dB): +/-{EQ_BELL_GAIN_DB_MAX_SIREN_BAND}",
+            f"EQ total accumulated gain limit (dB): +/-{EQ_TOTAL_GAIN_DB_LIMIT}",
+            "EQ low-shelf cutoff range (Hz): "
+            f"{EQ_LOW_SHELF_CUTOFF_HZ_RANGE[0]} - {EQ_LOW_SHELF_CUTOFF_HZ_RANGE[1]}",
+            "EQ bell center range (Hz): "
+            f"{EQ_BELL_CENTER_HZ_RANGE[0]} - {EQ_BELL_CENTER_HZ_RANGE[1]}",
+            "EQ high-shelf cutoff range (Hz): "
+            f"{EQ_HIGH_SHELF_CUTOFF_HZ_RANGE[0]} - {EQ_HIGH_SHELF_CUTOFF_HZ_RANGE[1]}",
+            "EQ bell bandwidth range (octaves): "
+            f"{EQ_BELL_BANDWIDTH_OCTAVES_RANGE[0]} - {EQ_BELL_BANDWIDTH_OCTAVES_RANGE[1]}",
+            "EQ shelf sharpness range: "
+            f"{EQ_SHELF_SHARPNESS_RANGE[0]} - {EQ_SHELF_SHARPNESS_RANGE[1]}",
             f"Balanced chunk batches: {USE_BALANCED_CHUNK_BATCHES}",
             f"Train chunk batch size: {TRAIN_CHUNK_BATCH_SIZE}",
             f"Effective class weights: {effective_use_class_weights}",
@@ -1586,8 +1850,14 @@ if __name__ == "__main__":
                     "chunk_length_s": CHUNK_LENGTH_S,
                     "overlap_s": OVERLAP_S,
                     "decision_step_s": CHUNK_STEP_S,
+                    "spectral_frontend": SPECTRAL_FRONTEND,
                     "feature_representation": FEATURE_REPRESENTATION,
                     "spectrogram_normalization": SPECTROGRAM_NORMALIZATION,
+                    "n_fft": N_FFT,
+                    "hop_length": HOP_LENGTH,
+                    "linear_freq_bins": LINEAR_FREQ_BINS,
+                    "time_frames": TIME_FRAMES,
+                    "mel_bins": MEL_BINS,
                     "split_stratify_columns": list(effective_split_stratify_columns),
                     "conv_filters": list(CONV_FILTERS),
                     "dense_units": DENSE_UNITS,
@@ -1599,6 +1869,18 @@ if __name__ == "__main__":
                     "effective_use_class_weights": effective_use_class_weights,
                     "use_data_augmentation": USE_DATA_AUGMENTATION,
                     "augmentation_apply_probability": AUGMENTATION_APPLY_PROB,
+                    "use_spectral_eq_augmentation": USE_SPECTRAL_EQ_AUGMENTATION,
+                    "eq_augmentation_probability": EQ_AUGMENTATION_PROB,
+                    "eq_effective_conditional_probability": get_effective_eq_apply_probability(),
+                    "eq_one_filter_probability": EQ_ONE_FILTER_PROB,
+                    "eq_shelf_gain_db_max": EQ_SHELF_GAIN_DB_MAX,
+                    "eq_bell_gain_db_max_siren_band": EQ_BELL_GAIN_DB_MAX_SIREN_BAND,
+                    "eq_total_gain_db_limit": EQ_TOTAL_GAIN_DB_LIMIT,
+                    "eq_low_shelf_cutoff_hz_range": list(EQ_LOW_SHELF_CUTOFF_HZ_RANGE),
+                    "eq_bell_center_hz_range": list(EQ_BELL_CENTER_HZ_RANGE),
+                    "eq_high_shelf_cutoff_hz_range": list(EQ_HIGH_SHELF_CUTOFF_HZ_RANGE),
+                    "eq_bell_bandwidth_octaves_range": list(EQ_BELL_BANDWIDTH_OCTAVES_RANGE),
+                    "eq_shelf_sharpness_range": list(EQ_SHELF_SHARPNESS_RANGE),
                     "use_frequency_normalization": SPECTROGRAM_NORMALIZATION == "frequency",
                     "use_threshold_analysis": USE_THRESHOLD_ANALYSIS,
                     "use_balanced_chunk_batches": USE_BALANCED_CHUNK_BATCHES,

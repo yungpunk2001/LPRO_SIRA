@@ -6,4 +6,8 @@ DataSet Camilo y Daniela/*
 !DataSet Camilo y Daniela/piloto_micro_mod.py
 !DataSet Camilo y Daniela/detector_sirena_tiempo_real.py
 !DataSet Camilo y Daniela/barrido_entrenamientos_margin_3.py
-!DataSet Camilo y Daniela/Clasificadores Tradicionales/+
+!DataSet Camilo y Daniela/Clasificadores Tradicionales/
+!DataSet Camilo y Daniela/Clasificadores Tradicionales/ALG_KNN.py
+!DataSet Camilo y Daniela/Clasificadores Tradicionales/detector_micros_svm_camilo.py
+!DataSet Camilo y Daniela/Clasificadores Tradicionales/entrenar_modelo_clasif_trad.py
+!DataSet Camilo y Daniela/Clasificadores Tradicionales/piloto_micro_clasif_trad.py
