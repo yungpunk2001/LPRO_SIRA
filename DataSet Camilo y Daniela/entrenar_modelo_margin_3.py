@@ -68,7 +68,7 @@ def get_config_value(name, default):
 # Script de entrenamiento de una CNN para detectar sirenas en audio.
 #
 # Idea general del pipeline:
-# 1. Leer cada audio y dividirlo en chunks de 0.5 s.
+# 1. Leer cada audio y dividirlo en chunks temporales configurables.
 # 2. Convertir cada chunk en una representacion espectral de tamano fijo.
 # 3. Entrenar una CNN binaria para estimar la probabilidad de "sirena".
 # 4. Evaluar el modelo chunk a chunk con metricas utiles para deteccion.
@@ -213,8 +213,29 @@ DENSE_UNITS = int(get_config_value("DENSE_UNITS", 32))
 N_FFT = int(get_config_value("N_FFT", 1024))
 HOP_LENGTH = int(get_config_value("HOP_LENGTH", 512))
 LINEAR_FREQ_BINS = int(get_config_value("LINEAR_FREQ_BINS", 359))
-TIME_FRAMES = int(get_config_value("TIME_FRAMES", 17))
+
+
+def get_default_time_frames():
+    """
+    Devuelve una anchura temporal coherente con la duracion real del chunk.
+
+    Para 0.5 s conserva el comportamiento historico del proyecto (17 frames),
+    pero al subir a 1.0 s amplía la entrada para que la CNN vea todo el
+    contexto temporal y no solo el primer medio segundo.
+    """
+    chunk_samples = int(round(CHUNK_LENGTH_S * SAMPLE_RATE))
+    return max(1, int(np.ceil(chunk_samples / HOP_LENGTH)) + 1)
+
+
+TIME_FRAMES = int(get_config_value("TIME_FRAMES", get_default_time_frames()))
 MEL_BINS = int(get_config_value("MEL_BINS", 128))
+PADDED_CHUNK_SAMPLES = int(
+    max(
+        int(round(CHUNK_LENGTH_S * SAMPLE_RATE)),
+        N_FFT,
+        HOP_LENGTH * max(0, TIME_FRAMES - 1),
+    )
+)
 
 # ---------------------------------------------------------------------------
 # Paralelismo para exprimir mejor la CPU durante el entrenamiento.
@@ -717,9 +738,13 @@ def extract_features_chunks(
             if augment and rng.random() < AUGMENTATION_APPLY_PROB:
                 audio_chunk = augment_audio_chunk(audio_chunk, sr, rng)
 
-            # Se rellena hasta 8192 muestras para obtener siempre TIME_FRAMES
-            # temporales al aplicar el frontend espectral con estos parametros.
-            audio_chunk_padded = np.pad(audio_chunk, (0, 8192 - len(audio_chunk)))
+            # Se ajusta el chunk a la longitud temporal esperada por la CNN.
+            # Asi 0.5 s mantiene 17 frames, mientras que 1.0 s puede usar una
+            # anchura mayor sin truncar la mitad del contexto temporal.
+            audio_chunk_padded = pad_or_trim(
+                audio_chunk,
+                PADDED_CHUNK_SAMPLES,
+            ).astype(np.float32)
 
             # A partir del chunk temporal se genera la entrada final para la CNN.
             features = build_feature_tensor_from_audio_chunk(audio_chunk_padded, sr=sr)
@@ -1792,6 +1817,7 @@ if __name__ == "__main__":
             f"Spectrogram normalization: {SPECTROGRAM_NORMALIZATION}",
             f"N_FFT: {N_FFT}",
             f"HOP_LENGTH: {HOP_LENGTH}",
+            f"Padded chunk samples: {PADDED_CHUNK_SAMPLES}",
             f"Linear freq bins: {LINEAR_FREQ_BINS}",
             f"Time frames: {TIME_FRAMES}",
             f"Mel bins: {MEL_BINS}",
@@ -1855,6 +1881,7 @@ if __name__ == "__main__":
                     "spectrogram_normalization": SPECTROGRAM_NORMALIZATION,
                     "n_fft": N_FFT,
                     "hop_length": HOP_LENGTH,
+                    "padded_chunk_samples": PADDED_CHUNK_SAMPLES,
                     "linear_freq_bins": LINEAR_FREQ_BINS,
                     "time_frames": TIME_FRAMES,
                     "mel_bins": MEL_BINS,
