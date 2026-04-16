@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime
 
 import librosa
@@ -856,6 +857,33 @@ def get_path_source(path_value):
     return "missing"
 
 
+def infer_siren_id_from_row(row):
+    """
+    Reconstruye un identificador de evento de sirena cuando el CSV no trae
+    `siren_id`.
+
+    Para grabaciones multicanal como `s-20210506-1652-ch1`, agrupa los canales
+    bajo el mismo evento base (`s-20210506-1652`) y evita leakage entre splits.
+    """
+    label_value = str(row.get("label", "")).strip().lower()
+    if label_value not in {"siren", "sirena"}:
+        return pd.NA
+
+    candidate_value = row.get("group_id", pd.NA)
+    if pd.isna(candidate_value) or not str(candidate_value).strip():
+        path_value = row.get("path", pd.NA)
+        if pd.isna(path_value):
+            return pd.NA
+        normalized_path = str(path_value).replace("\\", "/")
+        candidate_value = os.path.splitext(os.path.basename(normalized_path))[0]
+
+    normalized_value = str(candidate_value).strip()
+    if not normalized_value:
+        return pd.NA
+
+    return re.sub(r"(?i)([-_](?:ch|mic)\d+)$", "", normalized_value)
+
+
 def enrich_metadata_columns(df):
     """
     Anade columnas auxiliares derivadas de `path` cuando el CSV no las incluye.
@@ -863,6 +891,8 @@ def enrich_metadata_columns(df):
     - `source`: dataset o procedencia del audio.
     - `domain`: proxy del dominio acustico. Si no existe en metadata, se toma
       igual que `source` para poder estratificar sin romper el script.
+    - `siren_id`: identificador de evento de sirena; si falta en el CSV se
+      deriva desde `group_id`/`path`.
     """
     df_local = df.copy()
 
@@ -871,6 +901,17 @@ def enrich_metadata_columns(df):
 
     if "domain" not in df_local.columns:
         df_local["domain"] = df_local["source"]
+
+    if "siren_id" not in df_local.columns:
+        df_local["siren_id"] = pd.NA
+
+    missing_siren_id_mask = df_local["siren_id"].isna() | (
+        df_local["siren_id"].astype(str).str.strip() == ""
+    )
+    if missing_siren_id_mask.any():
+        df_local.loc[missing_siren_id_mask, "siren_id"] = df_local.loc[
+            missing_siren_id_mask
+        ].apply(infer_siren_id_from_row, axis=1)
 
     return df_local
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -444,6 +445,32 @@ def get_path_source(path_value) -> str:
     return "missing"
 
 
+def infer_siren_id_from_row(row: pd.Series):
+    """
+    Reconstruye `siren_id` cuando el indice maestro no lo incluye.
+
+    Si el `group_id` representa canales del mismo evento (`...-ch1`, `...-ch2`,
+    etc.), elimina ese sufijo para agrupar correctamente y evitar leakage entre
+    train/validation/test.
+    """
+    label_value = str(row.get("label", "")).strip().lower()
+    if label_value not in {"siren", "sirena"}:
+        return pd.NA
+
+    candidate_value = row.get("group_id", pd.NA)
+    if pd.isna(candidate_value) or not str(candidate_value).strip():
+        path_value = row.get("path", pd.NA)
+        if pd.isna(path_value):
+            return pd.NA
+        candidate_value = Path(str(path_value)).stem
+
+    normalized_value = str(candidate_value).strip()
+    if not normalized_value:
+        return pd.NA
+
+    return re.sub(r"(?i)([-_](?:ch|mic)\d+)$", "", normalized_value)
+
+
 def enrich_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
     df_local = df.copy()
 
@@ -452,6 +479,17 @@ def enrich_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     if "domain" not in df_local.columns:
         df_local["domain"] = df_local["source"]
+
+    if "siren_id" not in df_local.columns:
+        df_local["siren_id"] = pd.NA
+
+    missing_siren_id_mask = df_local["siren_id"].isna() | (
+        df_local["siren_id"].astype(str).str.strip() == ""
+    )
+    if missing_siren_id_mask.any():
+        df_local.loc[missing_siren_id_mask, "siren_id"] = df_local.loc[
+            missing_siren_id_mask
+        ].apply(infer_siren_id_from_row, axis=1)
 
     return df_local
 
