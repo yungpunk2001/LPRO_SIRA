@@ -12,3 +12,5 @@ DataSet Camilo y Daniela/*
 !DataSet Camilo y Daniela/Clasificadores Tradicionales/detector_micros_svm_camilo.py
 !DataSet Camilo y Daniela/Clasificadores Tradicionales/entrenar_modelo_clasif_trad.py
 !DataSet Camilo y Daniela/Clasificadores Tradicionales/piloto_micro_clasif_trad.py
+!DataSet Camilo y Daniela/Clasificadores Tradicionales/barrido_entrenamientos_clasif_trad.py
+!DataSet Camilo y Daniela/Clasificadores Tradicionales/clasif_trad_utils.py
