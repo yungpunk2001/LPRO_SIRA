@@ -445,6 +445,44 @@ def get_path_source(path_value) -> str:
     return "missing"
 
 
+def normalize_multichannel_group_id(group_id_value) -> str:
+    """Elimina sufijos de canal/microfono para agrupar una misma escena."""
+    if pd.isna(group_id_value):
+        return ""
+
+    normalized_value = str(group_id_value).strip()
+    if not normalized_value:
+        return ""
+
+    return re.sub(r"(?i)([-_](?:ch|mic)\d+)$", "", normalized_value)
+
+
+def infer_background_group_id_from_row(row: pd.Series):
+    """
+    Reconstruye un identificador de escena para backgrounds.
+
+    Casos especiales:
+    - A3S multicanal: agrupa `n-...-ch1/ch2/...`.
+    - UrbanSound8K_Clasificado: agrupa subsegmentos `...-0`, `...-1`, etc.
+    """
+    candidate_value = row.get("group_id", pd.NA)
+    if pd.isna(candidate_value) or not str(candidate_value).strip():
+        path_value = row.get("path", pd.NA)
+        if pd.isna(path_value):
+            return pd.NA
+        candidate_value = Path(str(path_value)).stem
+
+    normalized_value = normalize_multichannel_group_id(candidate_value)
+    if not normalized_value:
+        return pd.NA
+
+    source_value = str(row.get("source", "")).strip().lower()
+    if source_value == "urbansound8k_clasificado":
+        normalized_value = re.sub(r"-(\d+)$", "", normalized_value)
+
+    return normalized_value or pd.NA
+
+
 def infer_siren_id_from_row(row: pd.Series):
     """
     Reconstruye `siren_id` cuando el indice maestro no lo incluye.
@@ -471,6 +509,90 @@ def infer_siren_id_from_row(row: pd.Series):
     return re.sub(r"(?i)([-_](?:ch|mic)\d+)$", "", normalized_value)
 
 
+def get_background_subclass_from_row(row: pd.Series):
+    """Devuelve la subcarpeta relevante del background cuando aporta contexto."""
+    label_value = str(row.get("label", "")).strip().lower()
+    if label_value != "background":
+        return pd.NA
+
+    source_value = str(row.get("source", "")).strip()
+    if source_value != "UrbanSound8K_Clasificado":
+        return pd.NA
+
+    path_value = row.get("path", pd.NA)
+    if pd.isna(path_value):
+        return pd.NA
+
+    normalized_path = str(path_value).replace("\\", "/")
+    path_parts = [part for part in normalized_path.split("/") if part]
+    if len(path_parts) >= 4:
+        return path_parts[3]
+    return pd.NA
+
+
+def get_background_sampling_bucket_from_row(row: pd.Series):
+    """
+    Define el bucket de muestreo de negatives usado en train.
+
+    - En UrbanSound8K_Clasificado se baja a subcarpeta.
+    - En el resto de fuentes se mantiene el `source`.
+    """
+    label_value = str(row.get("label", "")).strip().lower()
+    if label_value != "background":
+        return pd.NA
+
+    source_value = str(row.get("source", "missing")).strip() or "missing"
+    subclass_value = row.get("background_subclass", pd.NA)
+    if pd.notna(subclass_value) and str(subclass_value).strip():
+        return f"{source_value}/{str(subclass_value).strip()}"
+    return source_value
+
+
+def normalize_scene_base_id(group_id_value) -> str:
+    """
+    Normaliza el identificador de escena para compartir split entre etiquetas.
+
+    Ejemplo:
+    - `s-20210506-1652` y `n-20210506-1652` se consideran la misma escena.
+    """
+    normalized_value = str(group_id_value).strip()
+    if not normalized_value:
+        return "missing"
+    return re.sub(r"^(?:s|n)-(?=\d)", "", normalized_value, flags=re.IGNORECASE)
+
+
+def build_safe_group_id(row: pd.Series) -> str:
+    """
+    Crea un identificador de grupo robusto frente a leakage.
+
+    La fuente se conserva en la clave, pero se comparte escena entre siren y
+    background cuando el identificador base apunta al mismo evento.
+    """
+    source_value = str(row.get("source", "missing")).strip() or "missing"
+    label_value = str(row.get("label", "")).strip().lower() or "missing"
+
+    if label_value in {"siren", "sirena"}:
+        base_group_id = row.get("siren_id", pd.NA)
+        if pd.isna(base_group_id) or not str(base_group_id).strip():
+            base_group_id = infer_siren_id_from_row(row)
+    else:
+        base_group_id = infer_background_group_id_from_row(row)
+
+    if pd.isna(base_group_id) or not str(base_group_id).strip():
+        raw_group_id = row.get("group_id", pd.NA)
+        if pd.notna(raw_group_id) and str(raw_group_id).strip():
+            base_group_id = str(raw_group_id).strip()
+        else:
+            path_value = row.get("path", pd.NA)
+            if pd.notna(path_value):
+                base_group_id = Path(str(path_value)).stem
+            else:
+                base_group_id = "missing"
+
+    normalized_scene_id = normalize_scene_base_id(base_group_id)
+    return f"{source_value}|{normalized_scene_id}"
+
+
 def enrich_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
     df_local = df.copy()
 
@@ -490,6 +612,16 @@ def enrich_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
         df_local.loc[missing_siren_id_mask, "siren_id"] = df_local.loc[
             missing_siren_id_mask
         ].apply(infer_siren_id_from_row, axis=1)
+
+    df_local["background_subclass"] = df_local.apply(
+        get_background_subclass_from_row,
+        axis=1,
+    )
+    df_local["background_sampling_bucket"] = df_local.apply(
+        get_background_sampling_bucket_from_row,
+        axis=1,
+    )
+    df_local["safe_group_id"] = df_local.apply(build_safe_group_id, axis=1)
 
     return df_local
 
@@ -534,17 +666,21 @@ def make_stratum_keys(df: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
 
 
 def split_assignment_cost(
-    current_counts: dict[str, int],
+    current_counts: dict[str, float],
+    current_weight: float,
     current_rows: int,
     target_counts: dict[str, float],
+    target_weight: float,
     target_rows: float,
+    row_cost_weight: float = 0.15,
 ) -> float:
+    weight_error = ((current_weight - target_weight) / max(1.0, target_weight)) ** 2
     row_error = ((current_rows - target_rows) / max(1.0, target_rows)) ** 2
     stratum_error = 0.0
     for key, target_value in target_counts.items():
         current_value = current_counts.get(key, 0)
         stratum_error += ((current_value - target_value) / max(1.0, target_value)) ** 2
-    return float(row_error + stratum_error)
+    return float(weight_error + (row_cost_weight * row_error) + stratum_error)
 
 
 def grouped_stratified_split(
@@ -553,14 +689,29 @@ def grouped_stratified_split(
     test_size: float,
     stratify_columns: Sequence[str],
     random_state: int = 42,
+    weight_col: str = "num_chunks",
+    row_cost_weight: float = 0.15,
 ) -> tuple[np.ndarray, np.ndarray]:
     df_local = df.copy()
     df_local["_stratum_key"] = make_stratum_keys(df_local, list(stratify_columns))
+    df_local["_split_weight"] = pd.to_numeric(
+        df_local.get(weight_col, 0.0),
+        errors="coerce",
+    ).fillna(0.0)
+
+    if float(df_local["_split_weight"].sum()) <= 0.0:
+        df_local["_split_weight"] = 1.0
+
+    total_weight = float(df_local["_split_weight"].sum())
+    target_test_weight = total_weight * float(test_size)
+    target_train_weight = total_weight - target_test_weight
 
     target_test_rows = len(df_local) * float(test_size)
     target_train_rows = len(df_local) - target_test_rows
 
-    total_stratum_counts = df_local["_stratum_key"].value_counts().to_dict()
+    total_stratum_counts = (
+        df_local.groupby("_stratum_key")["_split_weight"].sum().to_dict()
+    )
     target_test_counts = {
         key: value * float(test_size) for key, value in total_stratum_counts.items()
     }
@@ -576,21 +727,28 @@ def grouped_stratified_split(
                 "group_id": group_id,
                 "indices": group_df.index.to_numpy(),
                 "size": len(group_df),
-                "counts": group_df["_stratum_key"].value_counts().to_dict(),
+                "weight": float(group_df["_split_weight"].sum()),
+                "counts": group_df.groupby("_stratum_key")["_split_weight"].sum().to_dict(),
                 "tie_breaker": float(rng.random()),
             }
         )
 
-    group_summaries.sort(key=lambda item: (-item["size"], item["tie_breaker"]))
+    group_summaries.sort(
+        key=lambda item: (-item["weight"], -item["size"], item["tie_breaker"])
+    )
 
     train_indices: list[int] = []
     test_indices: list[int] = []
+    train_weight = 0.0
+    test_weight = 0.0
     train_rows = 0
     test_rows = 0
-    train_counts: dict[str, int] = {}
-    test_counts: dict[str, int] = {}
+    train_counts: dict[str, float] = {}
+    test_counts: dict[str, float] = {}
 
     for summary in group_summaries:
+        candidate_train_weight = train_weight + summary["weight"]
+        candidate_test_weight = test_weight + summary["weight"]
         candidate_train_rows = train_rows + summary["size"]
         candidate_test_rows = test_rows + summary["size"]
 
@@ -602,33 +760,47 @@ def grouped_stratified_split(
 
         train_cost = split_assignment_cost(
             candidate_train_counts,
+            candidate_train_weight,
             candidate_train_rows,
             target_train_counts,
+            target_train_weight,
             target_train_rows,
+            row_cost_weight=row_cost_weight,
         ) + split_assignment_cost(
             test_counts,
+            test_weight,
             test_rows,
             target_test_counts,
+            target_test_weight,
             target_test_rows,
+            row_cost_weight=row_cost_weight,
         )
         test_cost = split_assignment_cost(
             train_counts,
+            train_weight,
             train_rows,
             target_train_counts,
+            target_train_weight,
             target_train_rows,
+            row_cost_weight=row_cost_weight,
         ) + split_assignment_cost(
             candidate_test_counts,
+            candidate_test_weight,
             candidate_test_rows,
             target_test_counts,
+            target_test_weight,
             target_test_rows,
+            row_cost_weight=row_cost_weight,
         )
 
         if test_cost < train_cost:
             test_indices.extend(summary["indices"].tolist())
+            test_weight = candidate_test_weight
             test_rows = candidate_test_rows
             test_counts = candidate_test_counts
         else:
             train_indices.extend(summary["indices"].tolist())
+            train_weight = candidate_train_weight
             train_rows = candidate_train_rows
             train_counts = candidate_train_counts
 

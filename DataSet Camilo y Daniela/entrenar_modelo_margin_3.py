@@ -199,10 +199,72 @@ USE_BALANCED_CHUNK_BATCHES = bool(get_config_value("USE_BALANCED_CHUNK_BATCHES",
 # Numero objetivo de chunks por lote cuando se activa el balanceo anterior.
 TRAIN_CHUNK_BATCH_SIZE = int(get_config_value("TRAIN_CHUNK_BATCH_SIZE", 64))
 
+# Version del manifiesto persistido para invalidar reutilizaciones antiguas
+# cuando cambie la logica de grouping/sampling del script.
+SPLIT_MANIFEST_VERSION = int(get_config_value("SPLIT_MANIFEST_VERSION", 3))
+
+# Reparto estable entre splits. Se usa para generar o validar el manifiesto.
+SPLIT_TRAIN_FRACTION = float(get_config_value("SPLIT_TRAIN_FRACTION", 0.70))
+SPLIT_VALIDATION_FRACTION = float(get_config_value("SPLIT_VALIDATION_FRACTION", 0.15))
+SPLIT_TEST_FRACTION = float(get_config_value("SPLIT_TEST_FRACTION", 0.15))
+
 # Columnas usadas para que train/validation/test mantengan proporciones mas
-# comparables sin romper la agrupacion por `grupo_seguro`.
+# comparables sin romper la agrupacion por `safe_group_id`.
 SPLIT_STRATIFY_COLUMNS = tuple(
     get_config_value("SPLIT_STRATIFY_COLUMNS", ["label", "domain"])
+)
+
+# El split se optimiza por chunks, pero se penaliza tambien la desviacion en
+# numero de audios para evitar subconjuntos muy raros.
+SPLIT_WEIGHT_COLUMN = str(get_config_value("SPLIT_WEIGHT_COLUMN", "num_chunks"))
+SPLIT_ROW_COST_WEIGHT = float(get_config_value("SPLIT_ROW_COST_WEIGHT", 0.15))
+REUSE_SPLIT_MANIFEST = bool(get_config_value("REUSE_SPLIT_MANIFEST", True))
+SAVE_SPLIT_MANIFEST = bool(get_config_value("SAVE_SPLIT_MANIFEST", True))
+SPLIT_MANIFEST_BASENAME = str(
+    get_config_value("SPLIT_MANIFEST_BASENAME", "split_manifest_margin_3_v3")
+)
+
+# Submuestreo opcional de backgrounds solo en train. Validation y test se
+# mantienen completos para medir falsas alarmas en una distribucion realista.
+APPLY_TRAIN_BACKGROUND_SUBSAMPLING = bool(
+    get_config_value("APPLY_TRAIN_BACKGROUND_SUBSAMPLING", True)
+)
+TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO = float(
+    get_config_value("TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO", 1.0)
+)
+TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET = int(
+    get_config_value("TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET", 1)
+)
+TRAIN_BACKGROUND_DEFAULT_BUCKET_WEIGHT = float(
+    get_config_value("TRAIN_BACKGROUND_DEFAULT_BUCKET_WEIGHT", 1.0)
+)
+TRAIN_BACKGROUND_HARD_NEGATIVE_WEIGHT = float(
+    get_config_value("TRAIN_BACKGROUND_HARD_NEGATIVE_WEIGHT", 2.0)
+)
+TRAIN_BACKGROUND_REDUCED_BUCKET_WEIGHT = float(
+    get_config_value("TRAIN_BACKGROUND_REDUCED_BUCKET_WEIGHT", 0.35)
+)
+TRAIN_BACKGROUND_HARD_NEGATIVE_BUCKETS = tuple(
+    get_config_value(
+        "TRAIN_BACKGROUND_HARD_NEGATIVE_BUCKETS",
+        [
+            "UrbanSound8K_Clasificado/car_horn",
+            "UrbanSound8K_Clasificado/children_playing",
+            "UrbanSound8K_Clasificado/drilling",
+            "UrbanSound8K_Clasificado/jackhammer",
+            "UrbanSound8K_Clasificado/street_music",
+        ],
+    )
+)
+TRAIN_BACKGROUND_REDUCED_BUCKETS = tuple(
+    get_config_value(
+        "TRAIN_BACKGROUND_REDUCED_BUCKETS",
+        [
+            "UrbanSound8K_Clasificado/air_conditioner",
+            "UrbanSound8K_Clasificado/dog_bark",
+            "UrbanSound8K_Clasificado/gun_shot",
+        ],
+    )
 )
 
 # La CNN se hace algo mas ancha que la version inicial para reducir
@@ -237,6 +299,41 @@ PADDED_CHUNK_SAMPLES = int(
         HOP_LENGTH * max(0, TIME_FRAMES - 1),
     )
 )
+
+
+def validate_split_configuration():
+    """Valida la configuracion global del manifiesto y del split."""
+    split_total = SPLIT_TRAIN_FRACTION + SPLIT_VALIDATION_FRACTION + SPLIT_TEST_FRACTION
+    if not np.isclose(split_total, 1.0, atol=1e-6):
+        raise ValueError(
+            "Las fracciones de train/validation/test deben sumar 1.0. "
+            f"Valor actual: {split_total:.6f}."
+        )
+
+    for split_name, split_value in (
+        ("train", SPLIT_TRAIN_FRACTION),
+        ("validation", SPLIT_VALIDATION_FRACTION),
+        ("test", SPLIT_TEST_FRACTION),
+    ):
+        if split_value <= 0.0 or split_value >= 1.0:
+            raise ValueError(
+                f"La fraccion del split {split_name} debe estar en (0, 1). "
+                f"Valor actual: {split_value}."
+            )
+
+    if TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO <= 0.0:
+        raise ValueError(
+            "TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO debe ser positivo para "
+            "conservar negativos en entrenamiento."
+        )
+
+    if TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET < 0:
+        raise ValueError(
+            "TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET no puede ser negativo."
+        )
+
+
+validate_split_configuration()
 
 # ---------------------------------------------------------------------------
 # Paralelismo para exprimir mejor la CPU durante el entrenamiento.
@@ -300,6 +397,16 @@ RUN_BASENAME = f"{RUN_NAME_PREFIX}_{RUN_TIMESTAMP}"
 MODEL_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}.keras")
 POSTPROCESSING_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}_postprocesado.json")
 CONFUSION_REPORT_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}_matrices_confusion.txt")
+SPLIT_MANIFEST_PATH = os.path.join(
+    DATASET_DIR,
+    "metadata",
+    f"{SPLIT_MANIFEST_BASENAME}.csv",
+)
+SPLIT_MANIFEST_INFO_PATH = os.path.join(
+    DATASET_DIR,
+    "metadata",
+    f"{SPLIT_MANIFEST_BASENAME}_info.json",
+)
 
 
 def configure_tensorflow_cpu_runtime():
@@ -857,6 +964,43 @@ def get_path_source(path_value):
     return "missing"
 
 
+def normalize_multichannel_group_id(group_id_value):
+    """Elimina sufijos de canal/microfono para agrupar una misma escena."""
+    if pd.isna(group_id_value):
+        return ""
+    normalized_value = str(group_id_value).strip()
+    if not normalized_value:
+        return ""
+    return re.sub(r"(?i)([-_](?:ch|mic)\d+)$", "", normalized_value)
+
+
+def infer_background_group_id_from_row(row):
+    """
+    Reconstruye un identificador de escena para backgrounds.
+
+    Casos especiales:
+    - A3S multicanal: agrupa `n-...-ch1/ch2/...` en una misma escena base.
+    - UrbanSound8K_Clasificado: agrupa subsegmentos `...-0`, `...-1`, etc.
+    """
+    candidate_value = row.get("group_id", pd.NA)
+    if pd.isna(candidate_value) or not str(candidate_value).strip():
+        path_value = row.get("path", pd.NA)
+        if pd.isna(path_value):
+            return pd.NA
+        normalized_path = str(path_value).replace("\\", "/")
+        candidate_value = os.path.splitext(os.path.basename(normalized_path))[0]
+
+    normalized_value = normalize_multichannel_group_id(candidate_value)
+    if not normalized_value:
+        return pd.NA
+
+    source_value = str(row.get("source", "")).strip().lower()
+    if source_value == "urbansound8k_clasificado":
+        normalized_value = re.sub(r"-(\d+)$", "", normalized_value)
+
+    return normalized_value or pd.NA
+
+
 def infer_siren_id_from_row(row):
     """
     Reconstruye un identificador de evento de sirena cuando el CSV no trae
@@ -884,6 +1028,92 @@ def infer_siren_id_from_row(row):
     return re.sub(r"(?i)([-_](?:ch|mic)\d+)$", "", normalized_value)
 
 
+def get_background_subclass_from_row(row):
+    """Devuelve la subcarpeta relevante del background cuando aporta contexto."""
+    label_value = str(row.get("label", "")).strip().lower()
+    if label_value != "background":
+        return pd.NA
+
+    source_value = str(row.get("source", "")).strip()
+    if source_value != "UrbanSound8K_Clasificado":
+        return pd.NA
+
+    path_value = row.get("path", pd.NA)
+    if pd.isna(path_value):
+        return pd.NA
+
+    normalized_path = str(path_value).replace("\\", "/")
+    path_parts = [part for part in normalized_path.split("/") if part]
+    if len(path_parts) >= 4:
+        return path_parts[3]
+    return pd.NA
+
+
+def get_background_sampling_bucket_from_row(row):
+    """
+    Define el bucket de muestreo de negatives usado solo en train.
+
+    - En UrbanSound8K_Clasificado se baja al nivel de subcarpeta para poder
+      priorizar hard negatives concretos.
+    - En el resto de fuentes se trabaja a nivel `source`.
+    """
+    label_value = str(row.get("label", "")).strip().lower()
+    if label_value != "background":
+        return pd.NA
+
+    source_value = str(row.get("source", "missing")).strip() or "missing"
+    subclass_value = row.get("background_subclass", pd.NA)
+    if pd.notna(subclass_value) and str(subclass_value).strip():
+        return f"{source_value}/{str(subclass_value).strip()}"
+    return source_value
+
+
+def normalize_scene_base_id(group_id_value):
+    """
+    Normaliza el identificador de escena para compartir split entre etiquetas.
+
+    Ejemplo:
+    - `s-20210506-1652` y `n-20210506-1652` se consideran la misma escena.
+    """
+    normalized_value = str(group_id_value).strip()
+    if not normalized_value:
+        return "missing"
+    return re.sub(r"^(?:s|n)-(?=\d)", "", normalized_value, flags=re.IGNORECASE)
+
+
+def build_safe_group_id(row):
+    """
+    Crea un identificador de grupo globalmente unico y anti-leakage.
+
+    La fuente se conserva en la clave, pero se intenta compartir escena entre
+    siren/background cuando el identificador base apunta al mismo evento.
+    """
+    source_value = str(row.get("source", "missing")).strip() or "missing"
+    label_value = str(row.get("label", "")).strip().lower() or "missing"
+
+    if label_value in {"siren", "sirena"}:
+        base_group_id = row.get("siren_id", pd.NA)
+        if pd.isna(base_group_id) or not str(base_group_id).strip():
+            base_group_id = infer_siren_id_from_row(row)
+    else:
+        base_group_id = infer_background_group_id_from_row(row)
+
+    if pd.isna(base_group_id) or not str(base_group_id).strip():
+        raw_group_id = row.get("group_id", pd.NA)
+        if pd.notna(raw_group_id) and str(raw_group_id).strip():
+            base_group_id = str(raw_group_id).strip()
+        else:
+            path_value = row.get("path", pd.NA)
+            if pd.notna(path_value):
+                normalized_path = str(path_value).replace("\\", "/")
+                base_group_id = os.path.splitext(os.path.basename(normalized_path))[0]
+            else:
+                base_group_id = "missing"
+
+    normalized_scene_id = normalize_scene_base_id(base_group_id)
+    return f"{source_value}|{normalized_scene_id}"
+
+
 def enrich_metadata_columns(df):
     """
     Anade columnas auxiliares derivadas de `path` cuando el CSV no las incluye.
@@ -893,6 +1123,9 @@ def enrich_metadata_columns(df):
       igual que `source` para poder estratificar sin romper el script.
     - `siren_id`: identificador de evento de sirena; si falta en el CSV se
       deriva desde `group_id`/`path`.
+    - `background_subclass`: subcarpeta relevante para negatives de UrbanSound.
+    - `background_sampling_bucket`: bucket usado para priorizar train.
+    - `safe_group_id`: grupo robusto frente a canales y subsegmentos.
     """
     df_local = df.copy()
 
@@ -912,6 +1145,13 @@ def enrich_metadata_columns(df):
         df_local.loc[missing_siren_id_mask, "siren_id"] = df_local.loc[
             missing_siren_id_mask
         ].apply(infer_siren_id_from_row, axis=1)
+
+    df_local["background_subclass"] = df_local.apply(get_background_subclass_from_row, axis=1)
+    df_local["background_sampling_bucket"] = df_local.apply(
+        get_background_sampling_bucket_from_row,
+        axis=1,
+    )
+    df_local["safe_group_id"] = df_local.apply(build_safe_group_id, axis=1)
 
     return df_local
 
@@ -958,8 +1198,17 @@ def make_stratum_keys(df, columns):
     return df.loc[:, columns].fillna("missing").astype(str).agg("|".join, axis=1)
 
 
-def split_assignment_cost(current_counts, current_rows, target_counts, target_rows):
+def split_assignment_cost(
+    current_counts,
+    current_weight,
+    current_rows,
+    target_counts,
+    target_weight,
+    target_rows,
+    row_cost_weight=SPLIT_ROW_COST_WEIGHT,
+):
     """Mide lo lejos que esta un split de sus proporciones objetivo."""
+    weight_error = ((current_weight - target_weight) / max(1.0, target_weight)) ** 2
     row_error = ((current_rows - target_rows) / max(1.0, target_rows)) ** 2
     stratum_error = 0.0
 
@@ -967,7 +1216,7 @@ def split_assignment_cost(current_counts, current_rows, target_counts, target_ro
         current_value = current_counts.get(key, 0)
         stratum_error += ((current_value - target_value) / max(1.0, target_value)) ** 2
 
-    return row_error + stratum_error
+    return weight_error + (row_cost_weight * row_error) + stratum_error
 
 
 def grouped_stratified_split(
@@ -976,18 +1225,34 @@ def grouped_stratified_split(
     test_size,
     stratify_columns=SPLIT_STRATIFY_COLUMNS,
     random_state=RANDOM_SEED,
+    weight_col=SPLIT_WEIGHT_COLUMN,
+    row_cost_weight=SPLIT_ROW_COST_WEIGHT,
 ):
     """
     Divide un DataFrame en dos subconjuntos manteniendo grupos completos y
     aproximando las proporciones de las columnas indicadas en `stratify_columns`.
+
+    El objetivo principal se mide por peso en chunks (`weight_col`) porque la
+    unidad real de entrenamiento/evaluacion de la CNN es el chunk, no el audio.
     """
     df_local = df.copy()
     df_local["_stratum_key"] = make_stratum_keys(df_local, list(stratify_columns))
+    df_local["_split_weight"] = pd.to_numeric(
+        df_local.get(weight_col, 0.0),
+        errors="coerce",
+    ).fillna(0.0)
+
+    if float(df_local["_split_weight"].sum()) <= 0.0:
+        df_local["_split_weight"] = 1.0
+
+    total_weight = float(df_local["_split_weight"].sum())
+    target_test_weight = total_weight * float(test_size)
+    target_train_weight = total_weight - target_test_weight
 
     target_test_rows = len(df_local) * float(test_size)
     target_train_rows = len(df_local) - target_test_rows
 
-    total_stratum_counts = df_local["_stratum_key"].value_counts().to_dict()
+    total_stratum_counts = df_local.groupby("_stratum_key")["_split_weight"].sum().to_dict()
     target_test_counts = {
         key: value * float(test_size) for key, value in total_stratum_counts.items()
     }
@@ -1004,21 +1269,28 @@ def grouped_stratified_split(
                 "group_id": group_id,
                 "indices": group_df.index.to_numpy(),
                 "size": len(group_df),
-                "counts": group_df["_stratum_key"].value_counts().to_dict(),
+                "weight": float(group_df["_split_weight"].sum()),
+                "counts": group_df.groupby("_stratum_key")["_split_weight"].sum().to_dict(),
                 "tie_breaker": float(rng.random()),
             }
         )
 
-    group_summaries.sort(key=lambda item: (-item["size"], item["tie_breaker"]))
+    group_summaries.sort(
+        key=lambda item: (-item["weight"], -item["size"], item["tie_breaker"])
+    )
 
     train_indices = []
     test_indices = []
+    train_weight = 0.0
+    test_weight = 0.0
     train_rows = 0
     test_rows = 0
     train_counts = {}
     test_counts = {}
 
     for summary in group_summaries:
+        candidate_train_weight = train_weight + summary["weight"]
+        candidate_test_weight = test_weight + summary["weight"]
         candidate_train_rows = train_rows + summary["size"]
         candidate_test_rows = test_rows + summary["size"]
 
@@ -1030,33 +1302,47 @@ def grouped_stratified_split(
 
         train_cost = split_assignment_cost(
             candidate_train_counts,
+            candidate_train_weight,
             candidate_train_rows,
             target_train_counts,
+            target_train_weight,
             target_train_rows,
+            row_cost_weight=row_cost_weight,
         ) + split_assignment_cost(
             test_counts,
+            test_weight,
             test_rows,
             target_test_counts,
+            target_test_weight,
             target_test_rows,
+            row_cost_weight=row_cost_weight,
         )
         test_cost = split_assignment_cost(
             train_counts,
+            train_weight,
             train_rows,
             target_train_counts,
+            target_train_weight,
             target_train_rows,
+            row_cost_weight=row_cost_weight,
         ) + split_assignment_cost(
             candidate_test_counts,
+            candidate_test_weight,
             candidate_test_rows,
             target_test_counts,
+            target_test_weight,
             target_test_rows,
+            row_cost_weight=row_cost_weight,
         )
 
         if test_cost < train_cost:
             test_indices.extend(summary["indices"].tolist())
+            test_weight = candidate_test_weight
             test_rows = candidate_test_rows
             test_counts = candidate_test_counts
         else:
             train_indices.extend(summary["indices"].tolist())
+            train_weight = candidate_train_weight
             train_rows = candidate_train_rows
             train_counts = candidate_train_counts
 
@@ -1095,6 +1381,402 @@ def add_chunk_count_column(
     return df_with_counts
 
 
+def get_background_bucket_weight(bucket_value):
+    """Devuelve el peso de muestreo de un bucket de backgrounds en train."""
+    normalized_bucket = str(bucket_value).strip()
+    if normalized_bucket in TRAIN_BACKGROUND_HARD_NEGATIVE_BUCKETS:
+        return TRAIN_BACKGROUND_HARD_NEGATIVE_WEIGHT
+    if normalized_bucket in TRAIN_BACKGROUND_REDUCED_BUCKETS:
+        return TRAIN_BACKGROUND_REDUCED_BUCKET_WEIGHT
+    return TRAIN_BACKGROUND_DEFAULT_BUCKET_WEIGHT
+
+
+def select_training_background_subset(
+    train_df,
+    random_state=RANDOM_SEED,
+    target_bg_to_siren_ratio=TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO,
+):
+    """
+    Selecciona un subconjunto reproducible de backgrounds solo para train.
+
+    Reglas:
+    - Siren se conserva completo.
+    - Validation/test no se tocan nunca.
+    - Background se submuestrea por grupos seguros y no por archivos sueltos.
+    - La prioridad de muestreo se define por buckets reproducibles y no por
+      orden fijo de fuentes.
+    - Se garantiza una representacion minima por bucket cuando el presupuesto
+      global de chunks lo permite.
+    """
+    curated_df = train_df.copy()
+    label_series = curated_df["label"].astype(str).str.strip().str.lower()
+    bg_mask = label_series == "background"
+    siren_mask = label_series.isin({"siren", "sirena"})
+
+    curated_df["train_keep"] = siren_mask
+    curated_df["background_sampling_weight"] = np.nan
+    if bg_mask.any():
+        curated_df.loc[bg_mask, "background_sampling_weight"] = curated_df.loc[
+            bg_mask, "background_sampling_bucket"
+        ].apply(get_background_bucket_weight)
+
+    if not APPLY_TRAIN_BACKGROUND_SUBSAMPLING:
+        curated_df.loc[bg_mask, "train_keep"] = True
+        return curated_df
+
+    siren_chunks = int(curated_df.loc[siren_mask, "num_chunks"].sum())
+    total_background_chunks = int(curated_df.loc[bg_mask, "num_chunks"].sum())
+    target_background_chunks = int(np.ceil(max(1.0, siren_chunks * target_bg_to_siren_ratio)))
+
+    if (
+        total_background_chunks <= target_background_chunks
+        or not bg_mask.any()
+        or siren_chunks <= 0
+    ):
+        curated_df.loc[bg_mask, "train_keep"] = True
+        return curated_df
+
+    valid_background_df = curated_df.loc[bg_mask & (curated_df["num_chunks"] > 0)].copy()
+    if valid_background_df.empty:
+        curated_df.loc[bg_mask, "train_keep"] = False
+        return curated_df
+
+    rng = np.random.default_rng(random_state)
+    group_records = []
+
+    for safe_group_id, group_df in valid_background_df.groupby("safe_group_id"):
+        bucket_series = group_df["background_sampling_bucket"].dropna().astype(str)
+        bucket_value = (
+            bucket_series.mode().iloc[0]
+            if not bucket_series.empty
+            else str(group_df["source"].iloc[0])
+        )
+        group_records.append(
+            {
+                "safe_group_id": safe_group_id,
+                "bucket": bucket_value,
+                "num_chunks": int(group_df["num_chunks"].sum()),
+                "bucket_weight": float(get_background_bucket_weight(bucket_value)),
+                "random_key": float(rng.random()),
+            }
+        )
+
+    groups_df = pd.DataFrame(group_records)
+    if groups_df.empty:
+        curated_df.loc[bg_mask, "train_keep"] = False
+        return curated_df
+
+    bucket_available_chunks = groups_df.groupby("bucket")["num_chunks"].sum().astype(float)
+    bucket_weights = groups_df.groupby("bucket")["bucket_weight"].first().astype(float)
+    weighted_available_chunks = bucket_available_chunks * bucket_weights
+    bucket_target_chunks = (
+        target_background_chunks * weighted_available_chunks / weighted_available_chunks.sum()
+    )
+
+    selected_group_ids = set()
+    selected_chunks = 0
+    selected_chunks_by_bucket = {bucket_name: 0 for bucket_name in bucket_target_chunks.index}
+
+    ordered_buckets = sorted(
+        bucket_target_chunks.index.tolist(),
+        key=lambda bucket_name: (
+            -float(bucket_target_chunks[bucket_name]),
+            -float(bucket_weights[bucket_name]),
+            bucket_name,
+        ),
+    )
+
+    def register_group_selection(group_row):
+        nonlocal selected_chunks
+        selected_group_ids.add(group_row.safe_group_id)
+        selected_chunks += int(group_row.num_chunks)
+        selected_chunks_by_bucket[group_row.bucket] = (
+            selected_chunks_by_bucket.get(group_row.bucket, 0) + int(group_row.num_chunks)
+        )
+
+    minimum_bucket_plan = []
+    if TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET > 0:
+        for bucket_name in ordered_buckets:
+            bucket_groups = groups_df.loc[groups_df["bucket"] == bucket_name].sort_values(
+                by=["num_chunks", "random_key"],
+                ascending=[True, True],
+            )
+            minimum_group_count = min(TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET, len(bucket_groups))
+            if minimum_group_count <= 0 or float(bucket_target_chunks[bucket_name]) <= 0.0:
+                continue
+
+            mandatory_groups = bucket_groups.head(minimum_group_count).copy()
+            minimum_bucket_plan.append(
+                {
+                    "bucket": bucket_name,
+                    "mandatory_chunks": int(mandatory_groups["num_chunks"].sum()),
+                    "mandatory_groups": mandatory_groups,
+                    "bucket_target": float(bucket_target_chunks[bucket_name]),
+                    "bucket_weight": float(bucket_weights[bucket_name]),
+                }
+            )
+
+        minimum_bucket_plan.sort(
+            key=lambda item: (
+                -item["bucket_target"],
+                -item["bucket_weight"],
+                item["mandatory_chunks"],
+                item["bucket"],
+            )
+        )
+
+        for plan_item in minimum_bucket_plan:
+            if (
+                selected_chunks + plan_item["mandatory_chunks"] > target_background_chunks
+                and selected_group_ids
+            ):
+                continue
+
+            for group_row in plan_item["mandatory_groups"].itertuples(index=False):
+                if group_row.safe_group_id in selected_group_ids:
+                    continue
+                register_group_selection(group_row)
+
+    for bucket_name in ordered_buckets:
+        if selected_chunks >= target_background_chunks and selected_group_ids:
+            break
+
+        bucket_target = float(bucket_target_chunks[bucket_name])
+        bucket_selected_chunks = selected_chunks_by_bucket.get(bucket_name, 0)
+        bucket_groups = groups_df.loc[groups_df["bucket"] == bucket_name].sort_values(
+            by=["random_key", "num_chunks"],
+            ascending=[True, True],
+        )
+
+        for group_row in bucket_groups.itertuples(index=False):
+            if group_row.safe_group_id in selected_group_ids:
+                continue
+            if (
+                bucket_selected_chunks >= bucket_target and bucket_selected_chunks > 0
+            ) or (
+                selected_chunks >= target_background_chunks and selected_group_ids
+            ):
+                break
+
+            register_group_selection(group_row)
+            bucket_selected_chunks = selected_chunks_by_bucket.get(bucket_name, 0)
+
+    if selected_chunks < target_background_chunks:
+        remaining_groups = groups_df.loc[
+            ~groups_df["safe_group_id"].isin(selected_group_ids)
+        ].sort_values(
+            by=["bucket_weight", "random_key", "num_chunks"],
+            ascending=[False, True, True],
+        )
+
+        for group_row in remaining_groups.itertuples(index=False):
+            selected_group_ids.add(group_row.safe_group_id)
+            selected_chunks += int(group_row.num_chunks)
+            if selected_chunks >= target_background_chunks:
+                break
+
+    curated_df.loc[bg_mask, "train_keep"] = curated_df.loc[bg_mask, "safe_group_id"].isin(
+        selected_group_ids
+    )
+
+    return curated_df
+
+
+def build_split_manifest_settings(stratify_columns):
+    """Resume la configuracion que hace valido un manifiesto persistido."""
+    return {
+        "manifest_version": SPLIT_MANIFEST_VERSION,
+        "sample_rate": SAMPLE_RATE,
+        "chunk_length_s": CHUNK_LENGTH_S,
+        "overlap_s": OVERLAP_S,
+        "random_seed": RANDOM_SEED,
+        "split_train_fraction": SPLIT_TRAIN_FRACTION,
+        "split_validation_fraction": SPLIT_VALIDATION_FRACTION,
+        "split_test_fraction": SPLIT_TEST_FRACTION,
+        "split_weight_column": SPLIT_WEIGHT_COLUMN,
+        "split_row_cost_weight": SPLIT_ROW_COST_WEIGHT,
+        "split_stratify_columns": list(stratify_columns),
+        "apply_train_background_subsampling": APPLY_TRAIN_BACKGROUND_SUBSAMPLING,
+        "train_background_to_siren_chunk_ratio": TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO,
+        "train_background_min_groups_per_bucket": TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET,
+        "train_background_default_bucket_weight": TRAIN_BACKGROUND_DEFAULT_BUCKET_WEIGHT,
+        "train_background_hard_negative_weight": TRAIN_BACKGROUND_HARD_NEGATIVE_WEIGHT,
+        "train_background_reduced_bucket_weight": TRAIN_BACKGROUND_REDUCED_BUCKET_WEIGHT,
+        "train_background_hard_negative_buckets": list(
+            TRAIN_BACKGROUND_HARD_NEGATIVE_BUCKETS
+        ),
+        "train_background_reduced_buckets": list(TRAIN_BACKGROUND_REDUCED_BUCKETS),
+    }
+
+
+def try_load_split_manifest(df_master, manifest_settings):
+    """Carga el manifiesto si existe y sigue siendo compatible con el dataset."""
+    if not REUSE_SPLIT_MANIFEST:
+        return None
+
+    if not os.path.exists(SPLIT_MANIFEST_PATH) or not os.path.exists(SPLIT_MANIFEST_INFO_PATH):
+        return None
+
+    try:
+        with open(SPLIT_MANIFEST_INFO_PATH, "r", encoding="utf-8") as file_handle:
+            stored_settings = json.load(file_handle)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Aviso: no se ha podido leer la informacion del manifiesto ({exc}).")
+        return None
+
+    if stored_settings != manifest_settings:
+        print("Aviso: el manifiesto persistido no coincide con la configuracion actual. Se regenerara.")
+        return None
+
+    try:
+        manifest_df = pd.read_csv(SPLIT_MANIFEST_PATH)
+    except Exception as exc:
+        print(f"Aviso: no se ha podido leer el manifiesto de splits ({exc}). Se regenerara.")
+        return None
+
+    required_columns = {"path", "split", "train_keep"}
+    if not required_columns.issubset(set(manifest_df.columns)):
+        print("Aviso: faltan columnas obligatorias en el manifiesto. Se regenerara.")
+        return None
+
+    current_paths = set(df_master["path"].astype(str))
+    manifest_paths = set(manifest_df["path"].astype(str))
+    if current_paths != manifest_paths:
+        print("Aviso: el manifiesto no corresponde al dataset actual. Se regenerara.")
+        return None
+
+    manifest_subset = manifest_df.loc[:, ["path", "split", "train_keep"]].copy()
+    manifest_subset["split"] = manifest_subset["split"].astype(str)
+    manifest_subset["train_keep"] = (
+        manifest_subset["train_keep"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .map({"true": True, "false": False})
+    )
+    if manifest_subset["train_keep"].isna().any():
+        print("Aviso: el manifiesto contiene valores no validos en `train_keep`. Se regenerara.")
+        return None
+    manifest_subset["train_keep"] = manifest_subset["train_keep"].astype(bool)
+    return manifest_subset
+
+
+def save_split_manifest(manifest_df, manifest_settings):
+    """Persistencia estable del split y del submuestreo de train."""
+    if not SAVE_SPLIT_MANIFEST:
+        return
+
+    os.makedirs(os.path.dirname(SPLIT_MANIFEST_PATH), exist_ok=True)
+    manifest_df.to_csv(SPLIT_MANIFEST_PATH, index=False)
+
+    with open(SPLIT_MANIFEST_INFO_PATH, "w", encoding="utf-8") as file_handle:
+        json.dump(manifest_settings, file_handle, indent=2)
+
+
+def build_split_manifest(df_master, stratify_columns):
+    """Genera el manifiesto completo de split y curacion de train."""
+    train_idx, temp_idx = grouped_stratified_split(
+        df_master,
+        group_col="safe_group_id",
+        test_size=(1.0 - SPLIT_TRAIN_FRACTION),
+        stratify_columns=stratify_columns,
+        random_state=RANDOM_SEED,
+        weight_col=SPLIT_WEIGHT_COLUMN,
+        row_cost_weight=SPLIT_ROW_COST_WEIGHT,
+    )
+
+    temp_df = df_master.iloc[temp_idx].copy()
+    relative_test_fraction = SPLIT_TEST_FRACTION / (
+        SPLIT_VALIDATION_FRACTION + SPLIT_TEST_FRACTION
+    )
+    validation_idx, test_idx = grouped_stratified_split(
+        temp_df,
+        group_col="safe_group_id",
+        test_size=relative_test_fraction,
+        stratify_columns=stratify_columns,
+        random_state=RANDOM_SEED,
+        weight_col=SPLIT_WEIGHT_COLUMN,
+        row_cost_weight=SPLIT_ROW_COST_WEIGHT,
+    )
+
+    split_labels = pd.Series("unassigned", index=df_master.index, dtype="object")
+    split_labels.iloc[train_idx] = "train"
+    split_labels.iloc[temp_df.iloc[validation_idx].index] = "validation"
+    split_labels.iloc[temp_df.iloc[test_idx].index] = "test"
+
+    manifest_df = df_master.loc[
+        :,
+        [
+            "path",
+            "label",
+            "source",
+            "domain",
+            "safe_group_id",
+            "background_sampling_bucket",
+            "num_chunks",
+        ],
+    ].copy()
+    manifest_df["split"] = split_labels.values
+    manifest_df["train_keep"] = False
+
+    train_curated_df = select_training_background_subset(
+        df_master.loc[split_labels == "train"].copy(),
+        random_state=RANDOM_SEED,
+        target_bg_to_siren_ratio=TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO,
+    )
+    manifest_df.loc[train_curated_df.index, "train_keep"] = train_curated_df["train_keep"].astype(bool)
+    return manifest_df
+
+
+def summarize_training_selection(full_train_df, selected_train_df):
+    """Resume en formato JSON-friendly que se ha quedado dentro de train."""
+    full_bg_df = full_train_df.loc[
+        full_train_df["label"].astype(str).str.strip().str.lower() == "background"
+    ]
+    selected_bg_df = selected_train_df.loc[
+        selected_train_df["label"].astype(str).str.strip().str.lower() == "background"
+    ]
+
+    summary = {
+        "train_split_audio_count": int(len(full_train_df)),
+        "train_selected_audio_count": int(len(selected_train_df)),
+        "train_split_chunk_count": int(full_train_df["num_chunks"].sum()),
+        "train_selected_chunk_count": int(selected_train_df["num_chunks"].sum()),
+        "siren_audio_count": int(
+            (selected_train_df["label"].astype(str).str.strip().str.lower().isin({"siren", "sirena"})).sum()
+        ),
+        "siren_chunk_count": int(
+            selected_train_df.loc[
+                selected_train_df["label"].astype(str).str.strip().str.lower().isin({"siren", "sirena"}),
+                "num_chunks",
+            ].sum()
+        ),
+        "background_audio_count_before": int(len(full_bg_df)),
+        "background_audio_count_after": int(len(selected_bg_df)),
+        "background_chunk_count_before": int(full_bg_df["num_chunks"].sum()),
+        "background_chunk_count_after": int(selected_bg_df["num_chunks"].sum()),
+        "background_bucket_count_before": int(full_bg_df["background_sampling_bucket"].nunique(dropna=True)),
+        "background_bucket_count_after": int(selected_bg_df["background_sampling_bucket"].nunique(dropna=True)),
+        "background_chunk_ratio_after": float(
+            selected_bg_df["num_chunks"].sum()
+            / max(
+                1.0,
+                selected_train_df.loc[
+                    selected_train_df["label"].astype(str).str.strip().str.lower().isin({"siren", "sirena"}),
+                    "num_chunks",
+                ].sum(),
+            )
+        ),
+        "background_chunks_by_bucket_before": full_bg_df.groupby("background_sampling_bucket")[
+            "num_chunks"
+        ].sum().sort_values(ascending=False).astype(int).to_dict(),
+        "background_chunks_by_bucket_after": selected_bg_df.groupby("background_sampling_bucket")[
+            "num_chunks"
+        ].sum().sort_values(ascending=False).astype(int).to_dict(),
+    }
+    return summary
+
+
 def print_split_diagnostics(split_name, df, stratify_columns=SPLIT_STRATIFY_COLUMNS):
     """
     Imprime diagnosticos del split tanto por audio como por chunk para detectar
@@ -1105,7 +1787,11 @@ def print_split_diagnostics(split_name, df, stratify_columns=SPLIT_STRATIFY_COLU
     print("Distribucion por audio (label):")
     print(df["label"].value_counts())
     print("Distribucion por chunk (label):")
-    print(df.groupby("label")["num_chunks"].sum())
+    label_chunk_counts = df.groupby("label")["num_chunks"].sum()
+    print(label_chunk_counts)
+    if {"background", "siren"}.issubset(set(label_chunk_counts.index)):
+        ratio = float(label_chunk_counts["background"] / max(1.0, label_chunk_counts["siren"]))
+        print(f"Ratio background/siren por chunk: {ratio:.2f}")
     available_stratify_columns = [
         column for column in stratify_columns if column in df.columns
     ]
@@ -1123,6 +1809,19 @@ def print_split_diagnostics(split_name, df, stratify_columns=SPLIT_STRATIFY_COLU
         print(df["source"].value_counts().head(10))
         print("Top fuentes por chunk:")
         print(df.groupby("source")["num_chunks"].sum().sort_values(ascending=False).head(10))
+
+    if "background_sampling_bucket" in df.columns:
+        background_df = df.loc[
+            df["label"].astype(str).str.strip().str.lower() == "background"
+        ]
+        if not background_df.empty:
+            print("Top buckets background por chunk:")
+            print(
+                background_df.groupby("background_sampling_bucket")["num_chunks"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(10)
+            )
 
 
 class AudioDataGenerator(Sequence):
@@ -1647,6 +2346,13 @@ if __name__ == "__main__":
         print(f"Claves sobrescritas: {', '.join(sorted(RUNTIME_CONFIG_OVERRIDES.keys()))}")
 
     df_master = pd.read_csv(METADATA_PATH)
+    if df_master["path"].duplicated().any():
+        duplicated_paths = df_master.loc[df_master["path"].duplicated(), "path"].tolist()[:10]
+        raise RuntimeError(
+            "El metadata contiene paths duplicados. Esto rompe el manifiesto de splits. "
+            f"Ejemplos: {duplicated_paths}"
+        )
+
     df_master = enrich_metadata_columns(df_master)
     effective_split_stratify_columns = resolve_stratify_columns(
         df_master,
@@ -1656,7 +2362,6 @@ if __name__ == "__main__":
 
     label_encoder = LabelEncoder()
     df_master["target"] = label_encoder.fit_transform(df_master["label"])
-    df_master["grupo_seguro"] = df_master["siren_id"].fillna(df_master["group_id"])
     print("Contando chunks validos de todo el dataset. Esto puede tardar unos minutos...")
     df_master = add_chunk_count_column(df_master, base_path=DATASET_DIR)
 
@@ -1667,48 +2372,86 @@ if __name__ == "__main__":
     print("Distribucion por chunk en el dataset completo:")
     print(df_master.groupby("label")["num_chunks"].sum())
 
+    manifest_settings = build_split_manifest_settings(effective_split_stratify_columns)
+    split_manifest = try_load_split_manifest(df_master, manifest_settings)
+
+    if split_manifest is None:
+        print(
+            "Generando un nuevo manifiesto de splits agrupados y estratificados por: "
+            f"{', '.join(effective_split_stratify_columns)}"
+        )
+        split_manifest = build_split_manifest(df_master, effective_split_stratify_columns)
+        save_split_manifest(split_manifest, manifest_settings)
+        if SAVE_SPLIT_MANIFEST:
+            print(f"Manifiesto de splits guardado en: {SPLIT_MANIFEST_PATH}")
+            print(f"Informacion del manifiesto guardada en: {SPLIT_MANIFEST_INFO_PATH}")
+    else:
+        print(f"Usando manifiesto de splits existente: {SPLIT_MANIFEST_PATH}")
+
+    df_master = df_master.merge(
+        split_manifest.loc[:, ["path", "split", "train_keep"]],
+        on="path",
+        how="left",
+        validate="one_to_one",
+    )
+
+    if df_master["split"].isna().any():
+        raise RuntimeError(
+            "Hay audios sin split asignado tras cargar el manifiesto. "
+            "Revisa el metadata y el fichero de manifiesto."
+        )
+
+    train_split_df = df_master.loc[df_master["split"] == "train"].copy()
+    val_df = df_master.loc[df_master["split"] == "validation"].copy()
+    test_df = df_master.loc[df_master["split"] == "test"].copy()
+
+    train_df = train_split_df.loc[
+        train_split_df["label"].astype(str).str.strip().str.lower().isin({"siren", "sirena"})
+        | train_split_df["train_keep"].astype(bool)
+    ].copy()
+    train_selection_summary = summarize_training_selection(train_split_df, train_df)
+
     print(
-        "Generando splits agrupados y estratificados por: "
-        f"{', '.join(effective_split_stratify_columns)}"
-    )
-    train_idx, temp_idx = grouped_stratified_split(
-        df_master,
-        group_col="grupo_seguro",
-        test_size=0.3,
-        stratify_columns=effective_split_stratify_columns,
-        random_state=RANDOM_SEED,
-    )
-
-    train_df = df_master.iloc[train_idx].reset_index(drop=True)
-    temp_df = df_master.iloc[temp_idx].reset_index(drop=True)
-
-    val_idx, test_idx = grouped_stratified_split(
-        temp_df,
-        group_col="grupo_seguro",
-        test_size=0.5,
-        stratify_columns=effective_split_stratify_columns,
-        random_state=RANDOM_SEED,
-    )
-
-    val_df = temp_df.iloc[val_idx].reset_index(drop=True)
-    test_df = temp_df.iloc[test_idx].reset_index(drop=True)
-
-    print(
-        f"Archivos originales distribuidos en -> Train: {len(train_df)} | "
+        f"Archivos originales distribuidos en -> Train: {len(train_split_df)} | "
         f"Validation: {len(val_df)} | Test: {len(test_df)}"
     )
     print(
-        f"Chunks validos distribuidos en -> Train: {int(train_df['num_chunks'].sum())} | "
+        f"Chunks validos distribuidos en -> Train: {int(train_split_df['num_chunks'].sum())} | "
         f"Validation: {int(val_df['num_chunks'].sum())} | Test: {int(test_df['num_chunks'].sum())}"
     )
     print(
         f"Configuracion temporal -> chunk: {CHUNK_LENGTH_S:.2f} s | "
         f"solapamiento: {OVERLAP_S:.2f} s | paso entre decisiones: {CHUNK_STEP_S:.2f} s"
     )
+    print(
+        "Curacion de train -> audios: {train_audio_count} -> {selected_audio_count} | "
+        "chunks: {train_chunk_count} -> {selected_chunk_count}".format(
+            train_audio_count=train_selection_summary["train_split_audio_count"],
+            selected_audio_count=train_selection_summary["train_selected_audio_count"],
+            train_chunk_count=train_selection_summary["train_split_chunk_count"],
+            selected_chunk_count=train_selection_summary["train_selected_chunk_count"],
+        )
+    )
+    print(
+        "Background train -> audios: {before_audio} -> {after_audio} | "
+        "chunks: {before_chunk} -> {after_chunk} | buckets: {before_bucket} -> {after_bucket} | "
+        "ratio bg/sirena final: {ratio:.2f}".format(
+            before_audio=train_selection_summary["background_audio_count_before"],
+            after_audio=train_selection_summary["background_audio_count_after"],
+            before_chunk=train_selection_summary["background_chunk_count_before"],
+            after_chunk=train_selection_summary["background_chunk_count_after"],
+            before_bucket=train_selection_summary["background_bucket_count_before"],
+            after_bucket=train_selection_summary["background_bucket_count_after"],
+            ratio=train_selection_summary["background_chunk_ratio_after"],
+        )
+    )
     print_parallelism_configuration()
-    print("Distribucion de clases en train:")
+    print("Distribucion de clases en train (split completo antes de curacion):")
+    print(train_split_df["label"].value_counts())
+    print_split_diagnostics("Train split completo", train_split_df, effective_split_stratify_columns)
+    print("Distribucion de clases en train (subset usado por el modelo):")
     print(train_df["label"].value_counts())
-    print_split_diagnostics("Train", train_df, effective_split_stratify_columns)
+    print_split_diagnostics("Train usado por el modelo", train_df, effective_split_stratify_columns)
     print_split_diagnostics("Validation", val_df, effective_split_stratify_columns)
     print_split_diagnostics("Test", test_df, effective_split_stratify_columns)
 
@@ -1862,7 +2605,23 @@ if __name__ == "__main__":
             f"Linear freq bins: {LINEAR_FREQ_BINS}",
             f"Time frames: {TIME_FRAMES}",
             f"Mel bins: {MEL_BINS}",
+            f"Split manifest path: {SPLIT_MANIFEST_PATH}",
+            f"Split manifest info path: {SPLIT_MANIFEST_INFO_PATH}",
+            f"Split train fraction: {SPLIT_TRAIN_FRACTION}",
+            f"Split validation fraction: {SPLIT_VALIDATION_FRACTION}",
+            f"Split test fraction: {SPLIT_TEST_FRACTION}",
             f"Split stratify columns: {', '.join(effective_split_stratify_columns)}",
+            f"Split weight column: {SPLIT_WEIGHT_COLUMN}",
+            f"Split row cost weight: {SPLIT_ROW_COST_WEIGHT}",
+            f"Train background subsampling: {APPLY_TRAIN_BACKGROUND_SUBSAMPLING}",
+            "Train background target ratio (bg/sirena chunks): "
+            f"{TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO}",
+            "Train background minimum groups per bucket: "
+            f"{TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET}",
+            "Train background hard-negative buckets: "
+            f"{', '.join(TRAIN_BACKGROUND_HARD_NEGATIVE_BUCKETS)}",
+            "Train background reduced buckets: "
+            f"{', '.join(TRAIN_BACKGROUND_REDUCED_BUCKETS)}",
             f"Use data augmentation: {USE_DATA_AUGMENTATION}",
             f"Augmentation apply probability: {AUGMENTATION_APPLY_PROB}",
             f"Use spectral EQ augmentation: {USE_SPECTRAL_EQ_AUGMENTATION}",
@@ -1892,6 +2651,8 @@ if __name__ == "__main__":
             f"PyDataset workers: {PYDATASET_WORKERS}",
             f"PyDataset multiprocessing: {PYDATASET_USE_MULTIPROCESSING}",
             f"PyDataset max queue size: {PYDATASET_MAX_QUEUE_SIZE}",
+            "Resumen de curacion de train: "
+            f"{json.dumps(train_selection_summary, ensure_ascii=True)}",
             f"Umbral de referencia: {best_threshold:.2f}",
             "",
             build_metrics_report_block("Validacion por chunk", val_metrics),
@@ -1926,7 +2687,15 @@ if __name__ == "__main__":
                     "linear_freq_bins": LINEAR_FREQ_BINS,
                     "time_frames": TIME_FRAMES,
                     "mel_bins": MEL_BINS,
+                    "split_manifest_path": SPLIT_MANIFEST_PATH,
+                    "split_manifest_info_path": SPLIT_MANIFEST_INFO_PATH,
+                    "split_manifest_version": SPLIT_MANIFEST_VERSION,
+                    "split_train_fraction": SPLIT_TRAIN_FRACTION,
+                    "split_validation_fraction": SPLIT_VALIDATION_FRACTION,
+                    "split_test_fraction": SPLIT_TEST_FRACTION,
                     "split_stratify_columns": list(effective_split_stratify_columns),
+                    "split_weight_column": SPLIT_WEIGHT_COLUMN,
+                    "split_row_cost_weight": SPLIT_ROW_COST_WEIGHT,
                     "conv_filters": list(CONV_FILTERS),
                     "dense_units": DENSE_UNITS,
                     "runtime_config_path": RUNTIME_CONFIG_PATH,
@@ -1953,6 +2722,19 @@ if __name__ == "__main__":
                     "use_threshold_analysis": USE_THRESHOLD_ANALYSIS,
                     "use_balanced_chunk_batches": USE_BALANCED_CHUNK_BATCHES,
                     "train_chunk_batch_size": TRAIN_CHUNK_BATCH_SIZE,
+                    "apply_train_background_subsampling": APPLY_TRAIN_BACKGROUND_SUBSAMPLING,
+                    "train_background_to_siren_chunk_ratio": TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO,
+                    "train_background_min_groups_per_bucket": TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET,
+                    "train_background_default_bucket_weight": TRAIN_BACKGROUND_DEFAULT_BUCKET_WEIGHT,
+                    "train_background_hard_negative_weight": TRAIN_BACKGROUND_HARD_NEGATIVE_WEIGHT,
+                    "train_background_reduced_bucket_weight": TRAIN_BACKGROUND_REDUCED_BUCKET_WEIGHT,
+                    "train_background_hard_negative_buckets": list(
+                        TRAIN_BACKGROUND_HARD_NEGATIVE_BUCKETS
+                    ),
+                    "train_background_reduced_buckets": list(
+                        TRAIN_BACKGROUND_REDUCED_BUCKETS
+                    ),
+                    "train_selection_summary": train_selection_summary,
                     "logical_cpu_count": LOGICAL_CPU_COUNT,
                     "tf_intra_op_threads": TF_INTRA_OP_THREADS,
                     "tf_inter_op_threads": TF_INTER_OP_THREADS,
