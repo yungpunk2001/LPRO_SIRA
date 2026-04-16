@@ -28,9 +28,11 @@ CONTINUE_ON_ERROR = True
 STREAM_TRAINING_LOGS = True
 MAX_EXPERIMENTS = None
 
-PRIMARY_RANK_METRIC = "validation_refit_f2"
-SECONDARY_RANK_METRIC = "validation_refit_recall"
-TERTIARY_RANK_METRIC = "validation_refit_auc_pr"
+# El barrido debe decidir con la validacion limpia previa al refit. Las
+# metricas `validation_refit_*` se conservan solo como referencia diagnostica.
+PRIMARY_RANK_METRIC = "validation_f2"
+SECONDARY_RANK_METRIC = "validation_recall"
+TERTIARY_RANK_METRIC = "validation_auc_pr"
 
 AUTO_ITERATIVE_REFINEMENT = True
 MAX_SWEEP_ROUNDS = 2
@@ -352,10 +354,10 @@ def format_row_compact(row, rank=None):
         f"overlap={row.get('config_use_overlap')} | "
         f"weights={row.get('config_use_class_weights')} | "
         f"augment={row.get('config_use_data_augmentation')} | "
-        f"val_refit_f2={safe_metric(row, 'validation_refit_f2', default=0.0):.4f} | "
-        f"val_refit_recall={safe_metric(row, 'validation_refit_recall', default=0.0):.4f} | "
-        f"val_refit_auc_pr={safe_metric(row, 'validation_refit_auc_pr', default=0.0):.4f} | "
-        f"fa/min={safe_metric(row, 'validation_refit_false_alarms_per_min', default=0.0):.2f}"
+        f"val_f2={safe_metric(row, 'validation_f2', default=0.0):.4f} | "
+        f"val_recall={safe_metric(row, 'validation_recall', default=0.0):.4f} | "
+        f"val_auc_pr={safe_metric(row, 'validation_auc_pr', default=0.0):.4f} | "
+        f"fa/min={safe_metric(row, 'validation_false_alarms_per_min', default=0.0):.2f}"
     )
 
 
@@ -514,7 +516,7 @@ def rank_rows(rows):
             safe_metric(row, TERTIARY_RANK_METRIC),
             -safe_metric(
                 row,
-                "validation_refit_false_alarms_per_min",
+                "validation_false_alarms_per_min",
                 default=1e9,
             ),
         ),
