@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import hashlib
 from datetime import datetime
 
 import librosa
@@ -63,6 +64,79 @@ RUNTIME_CONFIG_OVERRIDES, RUNTIME_CONFIG_PATH = load_runtime_config_overrides()
 def get_config_value(name, default):
     """Devuelve el valor sobrescrito desde JSON o el valor por defecto."""
     return RUNTIME_CONFIG_OVERRIDES.get(name, default)
+
+
+def build_default_split_manifest_basename():
+    """
+    Construye un basename reproducible y especifico de la configuracion de split.
+
+    Esto evita que configuraciones distintas del pipeline compartan el mismo
+    CSV/JSON de manifiesto dentro de `dataset/metadata`.
+    """
+    fingerprint_payload = {
+        "sample_rate": int(get_config_value("SAMPLE_RATE", 16000)),
+        "chunk_length_s": float(get_config_value("CHUNK_LENGTH_S", 0.5)),
+        "overlap_s": float(get_config_value("OVERLAP_S", 0.0)),
+        "random_seed": int(get_config_value("RANDOM_SEED", 42)),
+        "split_train_fraction": float(get_config_value("SPLIT_TRAIN_FRACTION", 0.70)),
+        "split_validation_fraction": float(
+            get_config_value("SPLIT_VALIDATION_FRACTION", 0.15)
+        ),
+        "split_test_fraction": float(get_config_value("SPLIT_TEST_FRACTION", 0.15)),
+        "split_stratify_columns": list(
+            get_config_value("SPLIT_STRATIFY_COLUMNS", ["label", "domain"])
+        ),
+        "split_weight_column": str(get_config_value("SPLIT_WEIGHT_COLUMN", "num_chunks")),
+        "split_row_cost_weight": float(get_config_value("SPLIT_ROW_COST_WEIGHT", 0.15)),
+        "apply_train_background_subsampling": bool(
+            get_config_value("APPLY_TRAIN_BACKGROUND_SUBSAMPLING", True)
+        ),
+        "train_background_to_siren_chunk_ratio": float(
+            get_config_value("TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO", 1.0)
+        ),
+        "train_background_min_groups_per_bucket": int(
+            get_config_value("TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET", 1)
+        ),
+        "train_background_default_bucket_weight": float(
+            get_config_value("TRAIN_BACKGROUND_DEFAULT_BUCKET_WEIGHT", 1.0)
+        ),
+        "train_background_hard_negative_weight": float(
+            get_config_value("TRAIN_BACKGROUND_HARD_NEGATIVE_WEIGHT", 2.0)
+        ),
+        "train_background_reduced_bucket_weight": float(
+            get_config_value("TRAIN_BACKGROUND_REDUCED_BUCKET_WEIGHT", 0.35)
+        ),
+        "train_background_hard_negative_buckets": list(
+            get_config_value(
+                "TRAIN_BACKGROUND_HARD_NEGATIVE_BUCKETS",
+                [
+                    "UrbanSound8K_Clasificado/car_horn",
+                    "UrbanSound8K_Clasificado/children_playing",
+                    "UrbanSound8K_Clasificado/drilling",
+                    "UrbanSound8K_Clasificado/jackhammer",
+                    "UrbanSound8K_Clasificado/street_music",
+                ],
+            )
+        ),
+        "train_background_reduced_buckets": list(
+            get_config_value(
+                "TRAIN_BACKGROUND_REDUCED_BUCKETS",
+                [
+                    "UrbanSound8K_Clasificado/air_conditioner",
+                    "UrbanSound8K_Clasificado/dog_bark",
+                    "UrbanSound8K_Clasificado/gun_shot",
+                ],
+            )
+        ),
+        "manifest_version": int(get_config_value("SPLIT_MANIFEST_VERSION", 3)),
+    }
+    payload_bytes = json.dumps(
+        fingerprint_payload,
+        sort_keys=True,
+        ensure_ascii=True,
+    ).encode("utf-8")
+    digest = hashlib.sha1(payload_bytes).hexdigest()[:12]
+    return f"split_manifest_margin_3_v3_{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +295,10 @@ SPLIT_ROW_COST_WEIGHT = float(get_config_value("SPLIT_ROW_COST_WEIGHT", 0.15))
 REUSE_SPLIT_MANIFEST = bool(get_config_value("REUSE_SPLIT_MANIFEST", True))
 SAVE_SPLIT_MANIFEST = bool(get_config_value("SAVE_SPLIT_MANIFEST", True))
 SPLIT_MANIFEST_BASENAME = str(
-    get_config_value("SPLIT_MANIFEST_BASENAME", "split_manifest_margin_3_v3")
+    get_config_value(
+        "SPLIT_MANIFEST_BASENAME",
+        build_default_split_manifest_basename(),
+    )
 )
 
 # Submuestreo opcional de backgrounds solo en train. Validation y test se
@@ -276,6 +353,8 @@ DENSE_UNITS = int(get_config_value("DENSE_UNITS", 32))
 N_FFT = int(get_config_value("N_FFT", 1024))
 HOP_LENGTH = int(get_config_value("HOP_LENGTH", 512))
 LINEAR_FREQ_BINS = int(get_config_value("LINEAR_FREQ_BINS", 359))
+STFT_WINDOW = str(get_config_value("STFT_WINDOW", "hamming"))
+HPSS_MARGIN = float(get_config_value("HPSS_MARGIN", 3.0))
 
 
 def get_default_time_frames():
@@ -749,7 +828,7 @@ def build_feature_tensor_from_linear_stft(stft_matrix):
     - o ambos canales apilados
     """
     full_sliced = stft_matrix[:LINEAR_FREQ_BINS, :TIME_FRAMES]
-    harmonic, _ = librosa.decompose.hpss(stft_matrix, margin=3.0)
+    harmonic, _ = librosa.decompose.hpss(stft_matrix, margin=HPSS_MARGIN)
     harmonic_sliced = harmonic[:LINEAR_FREQ_BINS, :TIME_FRAMES]
 
     full_db = librosa.amplitude_to_db(np.abs(full_sliced), ref=np.max)
@@ -783,7 +862,7 @@ def build_feature_tensor_from_audio_chunk(audio_chunk_padded, sr=SAMPLE_RATE):
             audio_chunk_padded,
             n_fft=N_FFT,
             hop_length=HOP_LENGTH,
-            window="hamming",
+            window=STFT_WINDOW,
         )
         return build_feature_tensor_from_linear_stft(stft)
 
@@ -2599,6 +2678,8 @@ if __name__ == "__main__":
             f"Spectral frontend: {SPECTRAL_FRONTEND}",
             f"Feature representation: {FEATURE_REPRESENTATION}",
             f"Spectrogram normalization: {SPECTROGRAM_NORMALIZATION}",
+            f"STFT window: {STFT_WINDOW}",
+            f"HPSS margin: {HPSS_MARGIN}",
             f"N_FFT: {N_FFT}",
             f"HOP_LENGTH: {HOP_LENGTH}",
             f"Padded chunk samples: {PADDED_CHUNK_SAMPLES}",
@@ -2681,6 +2762,8 @@ if __name__ == "__main__":
                     "spectral_frontend": SPECTRAL_FRONTEND,
                     "feature_representation": FEATURE_REPRESENTATION,
                     "spectrogram_normalization": SPECTROGRAM_NORMALIZATION,
+                    "window": STFT_WINDOW,
+                    "hpss_margin": HPSS_MARGIN,
                     "n_fft": N_FFT,
                     "hop_length": HOP_LENGTH,
                     "padded_chunk_samples": PADDED_CHUNK_SAMPLES,

@@ -45,7 +45,6 @@ ROUND_REPORT_TOP_N = 8
 # Constantes compartidas para refinamiento.
 # ---------------------------------------------------------------------------
 CORE_CHUNK_LENGTHS_S = [0.5, 1.0]
-OVERLAP_CANDIDATES_S = [0.125, 0.25]
 AUGMENTATION_PROB_CANDIDATES = [0.35, 0.65]
 EQ_AUGMENTATION_PROB_CANDIDATES = [0.10, 0.35]
 AUGMENTATION_EXTRA_COPIES_CANDIDATES = [1, 2]
@@ -67,7 +66,8 @@ FIXED_OVERRIDES = {
     "SHOW_RF_PLOT": False,
     "TARGET_FALSE_ALARMS_PER_MIN": 1.0,
     "CHUNK_LENGTH_S": 0.5,
-    "OVERLAP_S": 0.125,
+    "USE_OVERLAP": False,
+    "OVERLAP_S": 0.0,
     "USE_SPECTRAL_EQ_AUGMENTATION": True,
     "EQ_AUGMENTATION_PROB": 0.20,
 }
@@ -84,8 +84,8 @@ EXPERIMENT_BATTERY = [
         "USE_DATA_AUGMENTATION": False,
     },
     {
-        "EXPERIMENT_LABEL": "solo_overlap",
-        "USE_OVERLAP": True,
+        "EXPERIMENT_LABEL": "solo_chunk_1p0s",
+        "CHUNK_LENGTH_S": 1.0,
         "USE_CLASS_WEIGHTS": False,
         "USE_DATA_AUGMENTATION": False,
     },
@@ -114,23 +114,21 @@ EXPERIMENT_BATTERY = [
         "AUGMENTATION_EXTRA_COPIES": 1,
     },
     {
-        "EXPERIMENT_LABEL": "overlap_y_augmentacion",
-        "USE_OVERLAP": True,
+        "EXPERIMENT_LABEL": "augmentacion_doble_copia",
         "USE_CLASS_WEIGHTS": False,
         "USE_DATA_AUGMENTATION": True,
         "USE_PITCH_SHIFT_AUGMENTATION": False,
         "AUGMENTATION_APPLY_PROB": 0.5,
-        "AUGMENTATION_EXTRA_COPIES": 1,
+        "AUGMENTATION_EXTRA_COPIES": 2,
     },
     {
-        "EXPERIMENT_LABEL": "overlap_y_class_weights",
-        "USE_OVERLAP": True,
+        "EXPERIMENT_LABEL": "class_weights_y_chunk_1p0s",
+        "CHUNK_LENGTH_S": 1.0,
         "USE_CLASS_WEIGHTS": True,
         "USE_DATA_AUGMENTATION": False,
     },
     {
         "EXPERIMENT_LABEL": "combinacion_prometedora",
-        "USE_OVERLAP": True,
         "USE_CLASS_WEIGHTS": True,
         "USE_DATA_AUGMENTATION": True,
         "USE_PITCH_SHIFT_AUGMENTATION": False,
@@ -586,8 +584,6 @@ def select_refinement_parents(ranked_rows, max_parents):
 def build_refinement_mutations(parent_row):
     parent_overrides = derive_overrides_from_row(parent_row)
     current_chunk_length_s = float(parent_overrides["CHUNK_LENGTH_S"])
-    current_use_overlap = bool(parent_overrides["USE_OVERLAP"])
-    current_overlap_s = float(parent_overrides["OVERLAP_S"])
     current_use_class_weights = bool(parent_overrides["USE_CLASS_WEIGHTS"])
     current_use_augmentation = bool(parent_overrides["USE_DATA_AUGMENTATION"])
     current_augmentation_prob = float(
@@ -620,39 +616,11 @@ def build_refinement_mutations(parent_row):
         if current_chunk_length_s < 0.75
         else CORE_CHUNK_LENGTHS_S[0]
     )
-    target_overlap_s = (
-        OVERLAP_CANDIDATES_S[1]
-        if float_close(current_overlap_s, OVERLAP_CANDIDATES_S[0])
-        else OVERLAP_CANDIDATES_S[0]
-    )
-
     mutations = [
         (
             f"chunk_{seconds_tag(target_chunk_length_s)}",
             {"CHUNK_LENGTH_S": target_chunk_length_s},
             "Cambia la duracion del chunk manteniendo el resto constante.",
-        ),
-        (
-            "overlap_off"
-            if current_use_overlap
-            else f"overlap_{seconds_tag(OVERLAP_CANDIDATES_S[0])}",
-            (
-                {"USE_OVERLAP": False}
-                if current_use_overlap
-                else {
-                    "USE_OVERLAP": True,
-                    "OVERLAP_S": OVERLAP_CANDIDATES_S[0],
-                }
-            ),
-            "Invierte el uso de overlap para medir su impacto local.",
-        ),
-        (
-            f"overlap_{seconds_tag(target_overlap_s)}",
-            {
-                "USE_OVERLAP": True,
-                "OVERLAP_S": target_overlap_s,
-            },
-            "Mantiene overlap activado pero cambia su intensidad.",
         ),
         (
             "weights_off" if current_use_class_weights else "weights_on",

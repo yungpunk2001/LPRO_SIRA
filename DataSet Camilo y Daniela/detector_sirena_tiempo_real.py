@@ -26,17 +26,16 @@ DEFAULT_MODEL_PATH = os.path.join(
 SAMPLE_RATE = 16000
 CHUNK_LENGTH_S = 0.5
 OVERLAP_S = 0.0
-PAD_TO = 8192
 N_FFT = 1024
 HOP_LENGTH = 512
 WINDOW = "hamming"
 HPSS_MARGIN = 3.0
-FREQ_BINS = 359
-TIME_FRAMES = 17
+LINEAR_FREQ_BINS = 359
+MEL_BINS = 128
 
+DEFAULT_SPECTRAL_FRONTEND = "linear_stft"
 DEFAULT_FEATURE_REPRESENTATION = "harmonic"
 DEFAULT_SPECTROGRAM_NORMALIZATION = "frequency"
-REFERENCE_CHUNK_THRESHOLD = 0.5
 DEFAULT_DECISION_THRESHOLD = 0.7
 DEFAULT_LABELS = ["background", "siren"]
 EXPECTED_OUTPUT_MODE = "chunk_probability"
@@ -46,19 +45,31 @@ PREFERRED_HOSTAPIS = (
     "MME",
     "Windows WDM-KS",
 )
+REQUIRED_POSTPROCESSING_KEYS = (
+    "chunk_length_s",
+)
+
+# El valor hardcodeado original puede quedar obsoleto o incluso romperse por
+# rutas absolutas con caracteres no ASCII. A partir de aqui se resuelve en
+# tiempo de ejecucion el modelo mas reciente que tenga su JSON asociado.
+MODELS_ROOT = os.path.join(SCRIPT_DIR, "Modelos Atlas")
+DEFAULT_MODEL_PATH = None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Captura audio de una tarjeta de entrada y clasifica cada chunk "
-            "de 0.5 s para detectar sirena usando el modelo de Keras."
+            "segun el preprocesado con el que se entreno el modelo de Keras."
         )
     )
     parser.add_argument(
         "--model-path",
         default=DEFAULT_MODEL_PATH,
-        help="Ruta al archivo .keras del modelo.",
+        help=(
+            "Ruta al archivo .keras del modelo. Si no se indica, se intenta "
+            "usar el mas reciente que tenga JSON de postprocesado."
+        ),
     )
     parser.add_argument(
         "--list-devices",
@@ -105,7 +116,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help=(
             "Umbral binario por chunk. Si no se indica, se usa el valor "
-            f"{DEFAULT_DECISION_THRESHOLD:.2f} en este script."
+            "recomendado en el JSON de postprocesado; si no existe, "
+            f"se usa {DEFAULT_DECISION_THRESHOLD:.2f}."
         ),
     )
     parser.add_argument(
@@ -121,16 +133,171 @@ def derive_postprocessing_path(model_path: str) -> str:
     return f"{base_path}_postprocesado.json"
 
 
+def list_available_model_paths(
+    models_root: str = MODELS_ROOT,
+    require_postprocessing: bool = True,
+) -> list[str]:
+    if not os.path.isdir(models_root):
+        return []
+
+    model_paths: list[str] = []
+    for current_root, _, filenames in os.walk(models_root):
+        for filename in filenames:
+            if not filename.lower().endswith(".keras"):
+                continue
+
+            model_path = os.path.join(current_root, filename)
+            if require_postprocessing and not os.path.exists(
+                derive_postprocessing_path(model_path)
+            ):
+                continue
+            model_paths.append(model_path)
+
+    model_paths.sort(
+        key=lambda path: (os.path.getmtime(path), path.lower()),
+        reverse=True,
+    )
+    return model_paths
+
+
+def find_default_model_path() -> str | None:
+    available_models = list_available_model_paths(require_postprocessing=True)
+    if available_models:
+        return available_models[0]
+    return None
+
+
+def get_missing_required_postprocessing_keys(saved_config: dict) -> list[str]:
+    missing_keys = [
+        key for key in REQUIRED_POSTPROCESSING_KEYS if key not in saved_config
+    ]
+    if "overlap_s" not in saved_config and "decision_step_s" not in saved_config:
+        missing_keys.append("overlap_s|decision_step_s")
+    return missing_keys
+
+
+def compute_default_time_frames(
+    chunk_length_s: float,
+    sample_rate: int,
+    hop_length: int,
+) -> int:
+    chunk_samples = int(round(chunk_length_s * sample_rate))
+    return max(1, int(np.ceil(chunk_samples / hop_length)) + 1)
+
+
+def compute_padded_chunk_samples(
+    chunk_length_s: float,
+    sample_rate: int,
+    n_fft: int,
+    hop_length: int,
+    time_frames: int,
+) -> int:
+    return int(
+        max(
+            int(round(chunk_length_s * sample_rate)),
+            n_fft,
+            hop_length * max(0, time_frames - 1),
+        )
+    )
+
+
+def build_default_runtime_config() -> dict:
+    time_frames = compute_default_time_frames(CHUNK_LENGTH_S, SAMPLE_RATE, HOP_LENGTH)
+    return {
+        "sample_rate": SAMPLE_RATE,
+        "chunk_length_s": CHUNK_LENGTH_S,
+        "overlap_s": OVERLAP_S,
+        "decision_step_s": CHUNK_LENGTH_S - OVERLAP_S,
+        "hpss_margin": HPSS_MARGIN,
+        "window": WINDOW,
+        "n_fft": N_FFT,
+        "hop_length": HOP_LENGTH,
+        "spectral_frontend": DEFAULT_SPECTRAL_FRONTEND,
+        "feature_representation": DEFAULT_FEATURE_REPRESENTATION,
+        "spectrogram_normalization": DEFAULT_SPECTROGRAM_NORMALIZATION,
+        "linear_freq_bins": LINEAR_FREQ_BINS,
+        "time_frames": time_frames,
+        "mel_bins": MEL_BINS,
+        "padded_chunk_samples": compute_padded_chunk_samples(
+            CHUNK_LENGTH_S,
+            SAMPLE_RATE,
+            N_FFT,
+            HOP_LENGTH,
+            time_frames,
+        ),
+        "chunk_threshold": DEFAULT_DECISION_THRESHOLD,
+        "labels": list(DEFAULT_LABELS),
+        "output_mode": EXPECTED_OUTPUT_MODE,
+        "_loaded_from_json": False,
+        "_has_saved_frontend": False,
+        "_has_saved_feature_representation": False,
+        "_has_saved_linear_freq_bins": False,
+        "_has_saved_time_frames": False,
+        "_has_saved_mel_bins": False,
+        "_has_saved_padded_chunk_samples": False,
+    }
+
+
 def finalize_runtime_config(runtime_config: dict) -> dict:
-    chunk_samples = int(runtime_config["chunk_length_s"] * runtime_config["sample_rate"])
+    runtime_config["sample_rate"] = int(runtime_config["sample_rate"])
+    runtime_config["chunk_length_s"] = float(runtime_config["chunk_length_s"])
+    runtime_config["overlap_s"] = float(runtime_config["overlap_s"])
+    runtime_config["hpss_margin"] = float(runtime_config["hpss_margin"])
+    runtime_config["window"] = str(runtime_config["window"])
+    runtime_config["n_fft"] = int(runtime_config["n_fft"])
+    runtime_config["hop_length"] = int(runtime_config["hop_length"])
+    runtime_config["chunk_threshold"] = float(runtime_config["chunk_threshold"])
+    runtime_config["spectral_frontend"] = str(runtime_config["spectral_frontend"])
+    feature_representation = runtime_config.get("feature_representation")
+    runtime_config["feature_representation"] = (
+        None if feature_representation is None else str(feature_representation)
+    )
+    runtime_config["spectrogram_normalization"] = str(
+        runtime_config["spectrogram_normalization"]
+    )
+
+    if runtime_config["n_fft"] <= 0 or runtime_config["hop_length"] <= 0:
+        raise ValueError("n_fft y hop_length deben ser positivos.")
+
+    if runtime_config["time_frames"] is None:
+        runtime_config["time_frames"] = compute_default_time_frames(
+            runtime_config["chunk_length_s"],
+            runtime_config["sample_rate"],
+            runtime_config["hop_length"],
+        )
+    else:
+        runtime_config["time_frames"] = int(runtime_config["time_frames"])
+
+    runtime_config["linear_freq_bins"] = int(
+        runtime_config.get("linear_freq_bins", LINEAR_FREQ_BINS)
+    )
+    runtime_config["mel_bins"] = int(runtime_config.get("mel_bins", MEL_BINS))
+
+    padded_chunk_samples = runtime_config.get("padded_chunk_samples")
+    if padded_chunk_samples is None:
+        runtime_config["padded_chunk_samples"] = compute_padded_chunk_samples(
+            runtime_config["chunk_length_s"],
+            runtime_config["sample_rate"],
+            runtime_config["n_fft"],
+            runtime_config["hop_length"],
+            runtime_config["time_frames"],
+        )
+    else:
+        runtime_config["padded_chunk_samples"] = int(padded_chunk_samples)
+
+    chunk_samples = int(
+        round(runtime_config["chunk_length_s"] * runtime_config["sample_rate"])
+    )
     step_samples = int(
-        (runtime_config["chunk_length_s"] - runtime_config["overlap_s"])
-        * runtime_config["sample_rate"]
+        round(
+            (runtime_config["chunk_length_s"] - runtime_config["overlap_s"])
+            * runtime_config["sample_rate"]
+        )
     )
     if step_samples <= 0:
         raise ValueError("El paso entre chunks debe ser mayor que cero.")
 
-    labels = runtime_config["labels"]
+    labels = [str(label) for label in runtime_config["labels"]]
     if len(labels) < 2:
         labels = list(DEFAULT_LABELS)
 
@@ -144,33 +311,66 @@ def finalize_runtime_config(runtime_config: dict) -> dict:
 
 
 def load_runtime_config(model_path: str) -> tuple[dict, str | None]:
-    runtime_config = {
-        "sample_rate": SAMPLE_RATE,
-        "chunk_length_s": CHUNK_LENGTH_S,
-        "overlap_s": OVERLAP_S,
-        "hpss_margin": HPSS_MARGIN,
-        "feature_representation": DEFAULT_FEATURE_REPRESENTATION,
-        "spectrogram_normalization": DEFAULT_SPECTROGRAM_NORMALIZATION,
-        "chunk_threshold": REFERENCE_CHUNK_THRESHOLD,
-        "labels": list(DEFAULT_LABELS),
-        "output_mode": EXPECTED_OUTPUT_MODE,
-    }
+    runtime_config = build_default_runtime_config()
 
     config_path = derive_postprocessing_path(model_path)
     if not os.path.exists(config_path):
-        return finalize_runtime_config(runtime_config), None
+        raise FileNotFoundError(
+            "No se encontro el JSON de postprocesado asociado al modelo.\n"
+            f"Modelo: {model_path}\n"
+            f"Esperado: {config_path}\n"
+            "El detector exige ese JSON para no reutilizar por error una "
+            "configuracion temporal incompatible con la del entrenamiento."
+        )
 
     with open(config_path, "r", encoding="utf-8") as file_handle:
         saved_config = json.load(file_handle)
 
-    runtime_config["chunk_length_s"] = float(
-        saved_config.get("chunk_length_s", runtime_config["chunk_length_s"])
+    missing_required_keys = get_missing_required_postprocessing_keys(saved_config)
+    if missing_required_keys:
+        raise ValueError(
+            "El JSON de postprocesado no incluye toda la configuracion minima "
+            "necesaria para una inferencia segura.\n"
+            f"Fichero: {config_path}\n"
+            f"Campos ausentes: {', '.join(missing_required_keys)}"
+        )
+
+    runtime_config["_loaded_from_json"] = True
+
+    runtime_config["sample_rate"] = saved_config.get(
+        "sample_rate",
+        runtime_config["sample_rate"],
     )
-    runtime_config["overlap_s"] = float(
-        saved_config.get("overlap_s", runtime_config["overlap_s"])
+    runtime_config["chunk_length_s"] = saved_config.get(
+        "chunk_length_s",
+        runtime_config["chunk_length_s"],
     )
-    runtime_config["chunk_threshold"] = float(
-        saved_config.get("recommended_chunk_threshold", runtime_config["chunk_threshold"])
+    runtime_config["overlap_s"] = saved_config.get(
+        "overlap_s",
+        runtime_config["overlap_s"],
+    )
+    if "overlap_s" not in saved_config and "decision_step_s" in saved_config:
+        runtime_config["overlap_s"] = float(runtime_config["chunk_length_s"]) - float(
+            saved_config["decision_step_s"]
+        )
+
+    runtime_config["chunk_threshold"] = saved_config.get(
+        "recommended_chunk_threshold",
+        runtime_config["chunk_threshold"],
+    )
+    runtime_config["hpss_margin"] = saved_config.get(
+        "hpss_margin",
+        runtime_config["hpss_margin"],
+    )
+    runtime_config["window"] = saved_config.get("window", runtime_config["window"])
+    runtime_config["n_fft"] = saved_config.get("n_fft", runtime_config["n_fft"])
+    runtime_config["hop_length"] = saved_config.get(
+        "hop_length",
+        runtime_config["hop_length"],
+    )
+    runtime_config["spectral_frontend"] = saved_config.get(
+        "spectral_frontend",
+        runtime_config["spectral_frontend"],
     )
     runtime_config["feature_representation"] = saved_config.get(
         "feature_representation",
@@ -180,8 +380,35 @@ def load_runtime_config(model_path: str) -> tuple[dict, str | None]:
         "spectrogram_normalization",
         runtime_config["spectrogram_normalization"],
     )
+    runtime_config["linear_freq_bins"] = saved_config.get(
+        "linear_freq_bins",
+        runtime_config["linear_freq_bins"],
+    )
+    runtime_config["time_frames"] = saved_config.get(
+        "time_frames",
+        runtime_config["time_frames"],
+    )
+    runtime_config["mel_bins"] = saved_config.get("mel_bins", runtime_config["mel_bins"])
+    runtime_config["padded_chunk_samples"] = saved_config.get(
+        "padded_chunk_samples",
+        runtime_config["padded_chunk_samples"],
+    )
     runtime_config["labels"] = list(saved_config.get("labels", runtime_config["labels"]))
-    runtime_config["output_mode"] = saved_config.get("output_mode", runtime_config["output_mode"])
+    runtime_config["output_mode"] = saved_config.get(
+        "output_mode",
+        runtime_config["output_mode"],
+    )
+
+    runtime_config["_has_saved_frontend"] = "spectral_frontend" in saved_config
+    runtime_config["_has_saved_feature_representation"] = (
+        "feature_representation" in saved_config
+    )
+    runtime_config["_has_saved_linear_freq_bins"] = "linear_freq_bins" in saved_config
+    runtime_config["_has_saved_time_frames"] = "time_frames" in saved_config
+    runtime_config["_has_saved_mel_bins"] = "mel_bins" in saved_config
+    runtime_config["_has_saved_padded_chunk_samples"] = (
+        "padded_chunk_samples" in saved_config
+    )
 
     if "spectrogram_normalization" not in saved_config:
         use_frequency_normalization = bool(saved_config.get("use_frequency_normalization", True))
@@ -216,10 +443,30 @@ def normalize_spectrogram(db_spectrogram: np.ndarray, mode: str) -> np.ndarray:
     )
 
 
-def build_feature_tensor_from_stft(stft_matrix: np.ndarray, runtime_config: dict) -> np.ndarray:
-    full_sliced = stft_matrix[:FREQ_BINS, :TIME_FRAMES]
-    harmonic, _ = librosa.decompose.hpss(stft_matrix, margin=runtime_config["hpss_margin"])
-    harmonic_sliced = harmonic[:FREQ_BINS, :TIME_FRAMES]
+def pad_or_trim_time_frames(feature_map: np.ndarray, target_frames: int) -> np.ndarray:
+    current_frames = feature_map.shape[1]
+    if current_frames < target_frames:
+        padding_shape = [(0, 0)] * feature_map.ndim
+        padding_shape[1] = (0, target_frames - current_frames)
+        return np.pad(feature_map, padding_shape)
+    if current_frames > target_frames:
+        return feature_map[:, :target_frames]
+    return feature_map
+
+
+def build_feature_tensor_from_linear_stft(
+    stft_matrix: np.ndarray,
+    runtime_config: dict,
+) -> np.ndarray:
+    freq_bins = runtime_config["linear_freq_bins"]
+    time_frames = runtime_config["time_frames"]
+
+    full_sliced = pad_or_trim_time_frames(stft_matrix[:freq_bins, :], time_frames)
+    harmonic, _ = librosa.decompose.hpss(
+        stft_matrix,
+        margin=runtime_config["hpss_margin"],
+    )
+    harmonic_sliced = pad_or_trim_time_frames(harmonic[:freq_bins, :], time_frames)
 
     full_db = librosa.amplitude_to_db(np.abs(full_sliced), ref=np.max)
     harmonic_db = librosa.amplitude_to_db(np.abs(harmonic_sliced), ref=np.max)
@@ -244,14 +491,40 @@ def build_feature_tensor_from_stft(stft_matrix: np.ndarray, runtime_config: dict
 def extract_features_from_array(audio_chunk: np.ndarray, runtime_config: dict) -> np.ndarray:
     chunk_samples = runtime_config["chunk_samples"]
     audio_chunk = pad_or_trim(audio_chunk.astype(np.float32, copy=False), chunk_samples)
-    audio_chunk_padded = np.pad(audio_chunk, (0, PAD_TO - len(audio_chunk)))
-    stft = librosa.stft(
-        audio_chunk_padded,
-        n_fft=N_FFT,
-        hop_length=HOP_LENGTH,
-        window=WINDOW,
+    audio_chunk_padded = pad_or_trim(
+        audio_chunk,
+        runtime_config["padded_chunk_samples"],
+    ).astype(np.float32, copy=False)
+
+    if runtime_config["spectral_frontend"] == "linear_stft":
+        stft = librosa.stft(
+            audio_chunk_padded,
+            n_fft=runtime_config["n_fft"],
+            hop_length=runtime_config["hop_length"],
+            window=runtime_config["window"],
+        )
+        return build_feature_tensor_from_linear_stft(stft, runtime_config)
+
+    if runtime_config["spectral_frontend"] == "log_mel":
+        mel_spectrogram = librosa.feature.melspectrogram(
+            y=audio_chunk_padded,
+            sr=runtime_config["sample_rate"],
+            n_fft=runtime_config["n_fft"],
+            hop_length=runtime_config["hop_length"],
+            n_mels=runtime_config["mel_bins"],
+            power=2.0,
+        )
+        mel_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
+        mel_db = pad_or_trim_time_frames(mel_db, runtime_config["time_frames"])
+        mel_db = normalize_spectrogram(
+            mel_db,
+            runtime_config["spectrogram_normalization"],
+        )
+        return np.expand_dims(mel_db, axis=-1).astype(np.float32)
+
+    raise ValueError(
+        "spectral_frontend debe ser 'linear_stft' o 'log_mel'."
     )
-    return build_feature_tensor_from_stft(stft, runtime_config)
 
 
 def pad_or_trim(audio: np.ndarray, target_length: int) -> np.ndarray:
@@ -268,9 +541,86 @@ def load_model_for_inference(model_path: str) -> tf.keras.Model:
     return tf.keras.models.load_model(model_path, compile=False)
 
 
+def infer_spectral_frontend_from_model(
+    model_input_shape: tuple[int, int, int],
+    runtime_config: dict,
+) -> str:
+    freq_bins, _, channels = model_input_shape
+    if channels == 2:
+        return "linear_stft"
+    if runtime_config.get("_has_saved_feature_representation") and runtime_config.get(
+        "feature_representation"
+    ) in {"harmonic", "full"}:
+        return "linear_stft"
+    if freq_bins == runtime_config["mel_bins"]:
+        return "log_mel"
+    return "linear_stft"
+
+
+def apply_model_shape_hints(model: tf.keras.Model, runtime_config: dict) -> dict:
+    input_shape = tuple(model.input_shape[1:])
+    if len(input_shape) != 3:
+        raise ValueError(
+            "Se esperaba un modelo con entrada 3D (freq, time, channels), "
+            f"pero se ha encontrado input_shape={model.input_shape}."
+        )
+
+    freq_bins, time_frames, channels = input_shape
+    if not runtime_config["_has_saved_frontend"]:
+        runtime_config["spectral_frontend"] = infer_spectral_frontend_from_model(
+            input_shape,
+            runtime_config,
+        )
+
+    if runtime_config["spectral_frontend"] == "linear_stft":
+        if not runtime_config["_has_saved_linear_freq_bins"]:
+            runtime_config["linear_freq_bins"] = freq_bins
+        if not runtime_config["_has_saved_time_frames"]:
+            runtime_config["time_frames"] = time_frames
+        if channels == 2:
+            runtime_config["feature_representation"] = "harmonic_full"
+        elif not runtime_config["_has_saved_feature_representation"]:
+            runtime_config["feature_representation"] = "harmonic"
+    elif runtime_config["spectral_frontend"] == "log_mel":
+        if not runtime_config["_has_saved_mel_bins"]:
+            runtime_config["mel_bins"] = freq_bins
+        if not runtime_config["_has_saved_time_frames"]:
+            runtime_config["time_frames"] = time_frames
+        runtime_config["feature_representation"] = "log_mel"
+    else:
+        raise ValueError(
+            "spectral_frontend debe ser 'linear_stft' o 'log_mel'."
+        )
+
+    if not runtime_config["_has_saved_padded_chunk_samples"]:
+        runtime_config["padded_chunk_samples"] = compute_padded_chunk_samples(
+            runtime_config["chunk_length_s"],
+            runtime_config["sample_rate"],
+            runtime_config["n_fft"],
+            runtime_config["hop_length"],
+            runtime_config["time_frames"],
+        )
+
+    return finalize_runtime_config(runtime_config)
+
+
 def expected_feature_shape(runtime_config: dict) -> tuple[int, int, int]:
-    channels = 2 if runtime_config["feature_representation"] == "harmonic_full" else 1
-    return (FREQ_BINS, TIME_FRAMES, channels)
+    if runtime_config["spectral_frontend"] == "linear_stft":
+        channels = 2 if runtime_config["feature_representation"] == "harmonic_full" else 1
+        return (
+            runtime_config["linear_freq_bins"],
+            runtime_config["time_frames"],
+            channels,
+        )
+    if runtime_config["spectral_frontend"] == "log_mel":
+        return (
+            runtime_config["mel_bins"],
+            runtime_config["time_frames"],
+            1,
+        )
+    raise ValueError(
+        "spectral_frontend debe ser 'linear_stft' o 'log_mel'."
+    )
 
 
 def validate_model_against_runtime(model: tf.keras.Model, runtime_config: dict) -> None:
@@ -829,11 +1179,23 @@ def describe_runtime(
         )
     )
     print(
-        "Representacion: {representation} | Normalizacion: {normalization} | "
-        "Umbral: {threshold:.2f}".format(
+        "Frontend: {frontend} | Representacion: {representation} | "
+        "Normalizacion: {normalization} | Umbral: {threshold:.2f}".format(
+            frontend=runtime_config["spectral_frontend"],
             representation=runtime_config["feature_representation"],
             normalization=runtime_config["spectrogram_normalization"],
             threshold=runtime_config["chunk_threshold"],
+        )
+    )
+    print(
+        "Preprocesado: n_fft={n_fft} | hop={hop} | frames={frames} | "
+        "linear_bins={linear_bins} | mel_bins={mel_bins} | padded_samples={padded}".format(
+            n_fft=runtime_config["n_fft"],
+            hop=runtime_config["hop_length"],
+            frames=runtime_config["time_frames"],
+            linear_bins=runtime_config["linear_freq_bins"],
+            mel_bins=runtime_config["mel_bins"],
+            padded=runtime_config["padded_chunk_samples"],
         )
     )
     if runtime_config["output_mode"] != EXPECTED_OUTPUT_MODE:
@@ -847,13 +1209,17 @@ def describe_runtime(
 def main() -> None:
     args = parse_args()
 
-    model_path = os.path.abspath(args.model_path)
+    resolved_model_path = args.model_path
+    if not resolved_model_path:
+        resolved_model_path = find_default_model_path()
+        if resolved_model_path is None:
+            raise FileNotFoundError(
+                "No se encontro ningun modelo .keras con su JSON de "
+                "postprocesado dentro de 'Modelos Atlas'."
+            )
+
+    model_path = os.path.abspath(resolved_model_path)
     runtime_config, config_path = load_runtime_config(model_path)
-    runtime_config["chunk_threshold"] = (
-        float(args.threshold)
-        if args.threshold is not None
-        else DEFAULT_DECISION_THRESHOLD
-    )
 
     input_devices, default_input = list_input_devices()
     if args.list_devices:
@@ -886,6 +1252,10 @@ def main() -> None:
     device_info = selected_device_info
 
     model = load_model_for_inference(model_path)
+    runtime_config = apply_model_shape_hints(model, runtime_config)
+    if args.threshold is not None:
+        runtime_config["chunk_threshold"] = float(args.threshold)
+        runtime_config = finalize_runtime_config(runtime_config)
     validate_model_against_runtime(model, runtime_config)
     describe_runtime(
         model_path=model_path,

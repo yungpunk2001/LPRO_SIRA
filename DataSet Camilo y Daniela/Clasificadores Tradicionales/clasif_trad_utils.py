@@ -48,6 +48,11 @@ DEFAULT_EQ_SHELF_SHARPNESS_RANGE = (2.0, 3.0)
 
 POSITIVE_LABEL_CANDIDATES = ("siren", "sirena")
 BACKGROUND_LABEL_CANDIDATES = ("background", "fondo", "noise", "ruido", "normal")
+REQUIRED_INFERENCE_METADATA_KEYS = (
+    "sample_rate",
+    "chunk_seconds",
+    "overlap_seconds",
+)
 
 
 def ensure_models_dir() -> Path:
@@ -1154,8 +1159,64 @@ def optimize_binary_threshold(
     }
 
 
+def validate_inference_bundle_metadata(
+    metadata: dict,
+    bundle_path: Path | str | None = None,
+) -> dict:
+    if not isinstance(metadata, dict):
+        raise ValueError("La metadata del bundle debe ser un diccionario.")
+
+    missing_keys = [
+        key for key in REQUIRED_INFERENCE_METADATA_KEYS if key not in metadata
+    ]
+    if missing_keys:
+        bundle_path_text = (
+            str(Path(bundle_path)) if bundle_path is not None else "desconocido"
+        )
+        raise ValueError(
+            "El bundle no incluye toda la metadata temporal necesaria para "
+            "inferir con seguridad.\n"
+            f"Bundle: {bundle_path_text}\n"
+            f"Campos ausentes: {', '.join(missing_keys)}"
+        )
+
+    metadata = dict(metadata)
+    metadata["sample_rate"] = int(metadata["sample_rate"])
+    metadata["chunk_seconds"] = float(metadata["chunk_seconds"])
+    metadata["overlap_seconds"] = float(metadata["overlap_seconds"])
+
+    decision_step_seconds = metadata.get("decision_step_seconds")
+    if decision_step_seconds is None:
+        decision_step_seconds = (
+            metadata["chunk_seconds"] - metadata["overlap_seconds"]
+        )
+    metadata["decision_step_seconds"] = float(decision_step_seconds)
+
+    if metadata["sample_rate"] <= 0:
+        raise ValueError("sample_rate debe ser positivo.")
+    if metadata["chunk_seconds"] <= 0.0:
+        raise ValueError("chunk_seconds debe ser positivo.")
+    if metadata["overlap_seconds"] < 0.0:
+        raise ValueError("overlap_seconds no puede ser negativo.")
+    if metadata["overlap_seconds"] >= metadata["chunk_seconds"]:
+        raise ValueError(
+            "overlap_seconds debe ser estrictamente menor que chunk_seconds."
+        )
+    if metadata["decision_step_seconds"] <= 0.0:
+        raise ValueError(
+            "decision_step_seconds debe ser positivo para que el streaming avance."
+        )
+
+    if bundle_path is not None:
+        metadata.setdefault("bundle_path", str(Path(bundle_path)))
+    return metadata
+
+
 def prepare_loaded_inference_bundle(bundle: dict, bundle_path: Path | str | None = None) -> dict:
-    metadata = bundle.get("metadata", {})
+    metadata = validate_inference_bundle_metadata(
+        bundle.get("metadata", {}),
+        bundle_path=bundle_path,
+    )
     model = bundle["model"]
 
     positive_class_encoded = metadata.get("positive_class_encoded")
@@ -1174,12 +1235,6 @@ def prepare_loaded_inference_bundle(bundle: dict, bundle_path: Path | str | None
         raise ValueError(
             "El bundle no incluye informacion suficiente para localizar la clase positiva."
         )
-
-    metadata.setdefault("sample_rate", DEFAULT_SR)
-    metadata.setdefault("chunk_seconds", DEFAULT_CHUNK_SEC)
-    metadata.setdefault("overlap_seconds", DEFAULT_OVERLAP_SEC)
-    if bundle_path is not None:
-        metadata.setdefault("bundle_path", str(Path(bundle_path)))
 
     bundle["metadata"] = metadata
     bundle["positive_probability_index"] = positive_probability_index
@@ -1377,7 +1432,10 @@ def list_available_inference_bundles(
         return []
 
     bundle_paths = sorted(
-        models_dir.glob("clasificador_tradicional_*_bundle.joblib")
+        {
+            path.resolve()
+            for path in models_dir.rglob("clasificador_tradicional_*_bundle.joblib")
+        }
     )
     bundles: list[dict] = []
 
@@ -1397,6 +1455,11 @@ def list_available_inference_bundles(
             or metadata.get("winner_name")
             or bundle_path.stem
         )
+        try:
+            relative_parent = bundle_path.parent.relative_to(models_dir)
+            location = "." if str(relative_parent) == "." else str(relative_parent)
+        except ValueError:
+            location = str(bundle_path.parent)
         bundles.append(
             {
                 "model_name": model_name,
@@ -1405,10 +1468,24 @@ def list_available_inference_bundles(
                 "recommended_threshold": float(bundle["runtime_threshold"]),
                 "winner_name": str(metadata.get("winner_name", model_name)),
                 "bundle_role": str(metadata.get("bundle_role", "model_specific")),
+                "chunk_seconds": float(metadata.get("chunk_seconds", DEFAULT_CHUNK_SEC)),
+                "overlap_seconds": float(
+                    metadata.get("overlap_seconds", DEFAULT_OVERLAP_SEC)
+                ),
+                "run_name": str(metadata.get("run_name") or bundle_path.parent.name),
+                "location": location,
+                "modified_timestamp": float(bundle_path.stat().st_mtime),
             }
         )
 
     if bundles:
+        bundles.sort(
+            key=lambda item: (
+                item["modified_timestamp"],
+                str(item["bundle_path"]).lower(),
+            ),
+            reverse=True,
+        )
         return bundles
 
     if BUNDLE_PATH.exists():
@@ -1432,30 +1509,31 @@ def list_available_inference_bundles(
     if LEGACY_MODEL_PATH.exists() and SCALER_PATH.exists():
         model = joblib.load(LEGACY_MODEL_PATH)
         scaler = joblib.load(SCALER_PATH)
-        positive_probability_index = resolve_probability_index(model.classes_, 1)
+        legacy_bundle = prepare_loaded_inference_bundle(
+            {
+                "model": model,
+                "scaler": scaler,
+                "label_encoder": None,
+                "metadata": {
+                    "winner_name": "SVM legado",
+                    "model_name": "SVM legado",
+                    "positive_label": "siren",
+                    "positive_class_encoded": 1,
+                    "recommended_threshold": 0.75,
+                    "sample_rate": DEFAULT_SR,
+                    "chunk_seconds": DEFAULT_CHUNK_SEC,
+                    "overlap_seconds": DEFAULT_OVERLAP_SEC,
+                    "bundle_path": str(LEGACY_MODEL_PATH),
+                },
+            },
+            bundle_path=LEGACY_MODEL_PATH,
+        )
         return [
             {
                 "model_name": "SVM legado",
                 "bundle_path": LEGACY_MODEL_PATH,
-                "bundle": {
-                    "model": model,
-                    "scaler": scaler,
-                    "label_encoder": None,
-                    "metadata": {
-                        "winner_name": "SVM legado",
-                        "model_name": "SVM legado",
-                        "positive_label": "siren",
-                        "positive_class_encoded": 1,
-                        "recommended_threshold": 0.75,
-                        "sample_rate": DEFAULT_SR,
-                        "chunk_seconds": DEFAULT_CHUNK_SEC,
-                        "overlap_seconds": DEFAULT_OVERLAP_SEC,
-                        "bundle_path": str(LEGACY_MODEL_PATH),
-                    },
-                    "positive_probability_index": positive_probability_index,
-                    "runtime_threshold": 0.75,
-                },
-                "recommended_threshold": 0.75,
+                "bundle": legacy_bundle,
+                "recommended_threshold": float(legacy_bundle["runtime_threshold"]),
                 "winner_name": "SVM legado",
                 "bundle_role": "legacy",
             }
@@ -1467,6 +1545,7 @@ def list_available_inference_bundles(
 def prompt_user_to_select_inference_bundle(
     models_dir: Path | str = MODELS_DIR,
 ) -> dict:
+    models_dir = Path(models_dir)
     available_bundles = list_available_inference_bundles(models_dir=models_dir)
     if not available_bundles:
         raise FileNotFoundError(
@@ -1478,10 +1557,15 @@ def prompt_user_to_select_inference_bundle(
         winner_suffix = ""
         if bundle_info["model_name"] == bundle_info["winner_name"]:
             winner_suffix = " [ganador]"
+        bundle_path = Path(bundle_info["bundle_path"])
         print(
             f"{index}. {bundle_info['model_name']}{winner_suffix} | "
+            f"rol={bundle_info['bundle_role']} | "
             f"umbral={bundle_info['recommended_threshold']:.2f} | "
-            f"archivo={Path(bundle_info['bundle_path']).name}"
+            f"chunk={bundle_info['chunk_seconds']:.3f}s | "
+            f"overlap={bundle_info['overlap_seconds']:.3f}s | "
+            f"run={bundle_info['run_name']} | "
+            f"ruta={bundle_info['location']}\\{bundle_path.name}"
         )
 
     while True:
