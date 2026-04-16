@@ -1,7 +1,6 @@
 *
 !.gitignore
 !DataSet Camilo y Daniela/
-DataSet Camilo y Daniela/*
 !DataSet Camilo y Daniela/entrenar_modelo_margin_3.py
 !DataSet Camilo y Daniela/piloto_micro_mod.py
 !DataSet Camilo y Daniela/detector_sirena_tiempo_real.py
@@ -14,3 +13,4 @@ DataSet Camilo y Daniela/*
 !DataSet Camilo y Daniela/Clasificadores Tradicionales/barrido_entrenamientos_clasif_trad.py
 !DataSet Camilo y Daniela/Clasificadores Tradicionales/clasif_trad_utils.py
 !DataSet Camilo y Daniela/dataset/metadata/master_index.csv
+DataSet Camilo y Daniela/*
