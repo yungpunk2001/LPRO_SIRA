@@ -7,15 +7,7 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Script de barrido de experimentos para `entrenar_modelo_clasif_trad.py`.
-#
-# Uso esperado:
-# 1. Ajustar solo esta cabecera para decidir que variantes comparar.
-# 2. Lanzar este script una vez.
-# 3. Revisar el resumen CSV/JSON y quedarse con el mejor experimento.
-#
-# El ranking principal se basa en F2 de validacion del modelo final
-# recalibrado, priorizando recall sin ignorar falsas alarmas.
+# Barrido iterativo para `entrenar_modelo_clasif_trad.py`.
 # ---------------------------------------------------------------------------
 
 
@@ -25,7 +17,7 @@ LOCAL_VENV_PYTHON = SCRIPT_DIR.parent / ".venv" / "Scripts" / "python.exe"
 
 
 # ---------------------------------------------------------------------------
-# Configuracion del barrido
+# Configuracion general del barrido
 # ---------------------------------------------------------------------------
 PYTHON_COMMAND = (
     [str(LOCAL_VENV_PYTHON)]
@@ -39,6 +31,28 @@ MAX_EXPERIMENTS = None
 PRIMARY_RANK_METRIC = "validation_refit_f2"
 SECONDARY_RANK_METRIC = "validation_refit_recall"
 TERTIARY_RANK_METRIC = "validation_refit_auc_pr"
+
+AUTO_ITERATIVE_REFINEMENT = True
+MAX_SWEEP_ROUNDS = 2
+REFINEMENT_TOP_K = 4
+REFINEMENT_MAX_CHILDREN_PER_PARENT = 6
+ROUND_REPORT_TOP_N = 8
+
+
+# ---------------------------------------------------------------------------
+# Constantes compartidas para refinamiento.
+# ---------------------------------------------------------------------------
+CORE_CHUNK_LENGTHS_S = [0.5, 1.0]
+OVERLAP_CANDIDATES_S = [0.125, 0.25]
+AUGMENTATION_PROB_CANDIDATES = [0.35, 0.65]
+EQ_AUGMENTATION_PROB_CANDIDATES = [0.10, 0.35]
+AUGMENTATION_EXTRA_COPIES_CANDIDATES = [1, 2]
+TARGET_FALSE_ALARMS_CANDIDATES = [0.5, 1.5]
+
+DEFAULT_RF_N_ESTIMATORS = 200
+DEFAULT_SVM_C = 1.0
+DEFAULT_SVM_GAMMA = "scale"
+DEFAULT_KNN_NEIGHBORS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -59,12 +73,6 @@ FIXED_OVERRIDES = {
 
 # ---------------------------------------------------------------------------
 # Bateria inicial controlada de experimentos.
-#
-# Se compara el impacto de:
-# - overlap
-# - class weights
-# - data augmentation
-# - pitch shift dentro de la augmentacion
 # ---------------------------------------------------------------------------
 EXPERIMENT_BATTERY = [
     {
@@ -130,8 +138,225 @@ EXPERIMENT_BATTERY = [
 ]
 
 
+def seconds_tag(seconds):
+    text = f"{float(seconds):.3f}".rstrip("0").rstrip(".")
+    return text.replace(".", "p") + "s"
+
+
+def prob_tag(value):
+    return str(value).replace(".", "p")
+
+
+def normalize_optional_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "si", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def safe_float(value, default):
+    if value is None:
+        return float(default)
+    return float(value)
+
+
+def safe_int(value, default):
+    if value is None:
+        return int(default)
+    return int(value)
+
+
+def float_close(left, right, tolerance=1e-9):
+    return abs(float(left) - float(right)) <= tolerance
+
+
 def build_experiment_grid():
-    return [dict(experiment) for experiment in EXPERIMENT_BATTERY]
+    experiments = []
+    for index, experiment in enumerate(EXPERIMENT_BATTERY, start=1):
+        experiment_copy = dict(experiment)
+        label = experiment_copy.get("EXPERIMENT_LABEL", f"seed_{index:03d}")
+        experiment_copy.setdefault("EXPERIMENT_TIER", "seed")
+        experiment_copy.setdefault("BASE_EXPERIMENT_ID", label)
+        experiment_copy.setdefault("BASE_EXPERIMENT_LABEL", label)
+        experiment_copy.setdefault(
+            "EXPERIMENT_NOTES",
+            "Configuracion base de la primera ronda del barrido tradicional.",
+        )
+        experiments.append(experiment_copy)
+    return experiments
+
+
+def build_experiment_signature_from_overrides(overrides):
+    use_overlap = normalize_optional_bool(overrides.get("USE_OVERLAP"), False)
+    use_data_augmentation = normalize_optional_bool(
+        overrides.get("USE_DATA_AUGMENTATION"),
+        False,
+    )
+    use_pitch_shift = normalize_optional_bool(
+        overrides.get("USE_PITCH_SHIFT_AUGMENTATION"),
+        True,
+    )
+    use_spectral_eq = normalize_optional_bool(
+        overrides.get("USE_SPECTRAL_EQ_AUGMENTATION"),
+        True,
+    )
+
+    return (
+        round(
+            safe_float(
+                overrides.get("CHUNK_LENGTH_S"),
+                FIXED_OVERRIDES["CHUNK_LENGTH_S"],
+            ),
+            4,
+        ),
+        use_overlap,
+        (
+            round(
+                safe_float(
+                    overrides.get("OVERLAP_S"),
+                    FIXED_OVERRIDES["OVERLAP_S"],
+                ),
+                4,
+            )
+            if use_overlap
+            else None
+        ),
+        normalize_optional_bool(overrides.get("USE_CLASS_WEIGHTS"), False),
+        use_data_augmentation,
+        (
+            round(safe_float(overrides.get("AUGMENTATION_APPLY_PROB"), 0.5), 4)
+            if use_data_augmentation
+            else None
+        ),
+        (
+            safe_int(overrides.get("AUGMENTATION_EXTRA_COPIES"), 1)
+            if use_data_augmentation
+            else None
+        ),
+        use_pitch_shift if use_data_augmentation else None,
+        use_spectral_eq if use_data_augmentation else None,
+        (
+            round(
+                safe_float(
+                    overrides.get("EQ_AUGMENTATION_PROB"),
+                    FIXED_OVERRIDES["EQ_AUGMENTATION_PROB"],
+                ),
+                4,
+            )
+            if use_data_augmentation and use_spectral_eq
+            else None
+        ),
+        round(
+            safe_float(
+                overrides.get("TARGET_FALSE_ALARMS_PER_MIN"),
+                FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+            ),
+            4,
+        ),
+        safe_int(overrides.get("RF_N_ESTIMATORS"), DEFAULT_RF_N_ESTIMATORS),
+        round(safe_float(overrides.get("SVM_C"), DEFAULT_SVM_C), 6),
+        str(overrides.get("SVM_GAMMA", DEFAULT_SVM_GAMMA)),
+        safe_int(overrides.get("KNN_NEIGHBORS"), DEFAULT_KNN_NEIGHBORS),
+    )
+
+
+def derive_overrides_from_row(row):
+    use_overlap = normalize_optional_bool(row.get("config_use_overlap"), False)
+    use_data_augmentation = normalize_optional_bool(
+        row.get("config_use_data_augmentation"),
+        False,
+    )
+    use_spectral_eq = normalize_optional_bool(
+        row.get("config_use_spectral_eq_augmentation"),
+        True,
+    )
+
+    overrides = {
+        "CHUNK_LENGTH_S": safe_float(
+            row.get("config_chunk_length_s"),
+            FIXED_OVERRIDES["CHUNK_LENGTH_S"],
+        ),
+        "USE_OVERLAP": use_overlap,
+        "OVERLAP_S": safe_float(
+            row.get("config_overlap_s"),
+            FIXED_OVERRIDES["OVERLAP_S"],
+        ),
+        "USE_CLASS_WEIGHTS": normalize_optional_bool(
+            row.get("config_use_class_weights"),
+            False,
+        ),
+        "USE_DATA_AUGMENTATION": use_data_augmentation,
+        "TARGET_FALSE_ALARMS_PER_MIN": safe_float(
+            row.get("config_target_false_alarms_per_min"),
+            FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+        ),
+        "RF_N_ESTIMATORS": safe_int(
+            row.get("config_rf_n_estimators"),
+            DEFAULT_RF_N_ESTIMATORS,
+        ),
+        "SVM_C": safe_float(row.get("config_svm_c"), DEFAULT_SVM_C),
+        "SVM_GAMMA": row.get("config_svm_gamma") or DEFAULT_SVM_GAMMA,
+        "KNN_NEIGHBORS": safe_int(
+            row.get("config_knn_neighbors"),
+            DEFAULT_KNN_NEIGHBORS,
+        ),
+    }
+
+    if use_data_augmentation:
+        overrides["USE_PITCH_SHIFT_AUGMENTATION"] = normalize_optional_bool(
+            row.get("config_use_pitch_shift_augmentation"),
+            True,
+        )
+        overrides["AUGMENTATION_APPLY_PROB"] = safe_float(
+            row.get("config_augmentation_apply_prob"),
+            0.5,
+        )
+        overrides["AUGMENTATION_EXTRA_COPIES"] = safe_int(
+            row.get("config_augmentation_extra_copies"),
+            1,
+        )
+        overrides["USE_SPECTRAL_EQ_AUGMENTATION"] = use_spectral_eq
+        if use_spectral_eq:
+            overrides["EQ_AUGMENTATION_PROB"] = safe_float(
+                row.get("config_eq_augmentation_prob"),
+                FIXED_OVERRIDES["EQ_AUGMENTATION_PROB"],
+            )
+
+    return overrides
+
+
+def build_experiment_signature_from_row(row):
+    return build_experiment_signature_from_overrides(derive_overrides_from_row(row))
+
+
+def build_round_dir_name(round_number):
+    return f"ronda_{round_number:02d}"
+
+
+def format_row_compact(row, rank=None):
+    rank_prefix = f"{rank}. " if rank is not None else ""
+    return (
+        f"{rank_prefix}{row['experiment_id']} ({row['experiment_label']}) | "
+        f"round={row.get('sweep_round')} | "
+        f"tier={row.get('experiment_tier')} | "
+        f"base={row.get('base_experiment_id')} | "
+        f"winner={row.get('winner_name')} | "
+        f"chunk={row.get('config_chunk_length_s')} s | "
+        f"overlap={row.get('config_use_overlap')} | "
+        f"weights={row.get('config_use_class_weights')} | "
+        f"augment={row.get('config_use_data_augmentation')} | "
+        f"val_refit_f2={safe_metric(row, 'validation_refit_f2', default=0.0):.4f} | "
+        f"val_refit_recall={safe_metric(row, 'validation_refit_recall', default=0.0):.4f} | "
+        f"val_refit_auc_pr={safe_metric(row, 'validation_refit_auc_pr', default=0.0):.4f} | "
+        f"fa/min={safe_metric(row, 'validation_refit_false_alarms_per_min', default=0.0):.2f}"
+    )
 
 
 def safe_metric(row, key, default=-1.0):
@@ -148,6 +373,8 @@ def build_summary_row(
     status,
     return_code,
     log_path,
+    sweep_round,
+    round_dir,
 ):
     validation_metrics = postprocess_data.get("validation_metrics") or {}
     validation_metrics_refit = postprocess_data.get("validation_metrics_refit") or {}
@@ -156,27 +383,80 @@ def build_summary_row(
     return {
         "experiment_id": experiment_id,
         "experiment_label": overrides.get("EXPERIMENT_LABEL"),
+        "sweep_round": sweep_round,
+        "round_dir": str(round_dir),
+        "experiment_tier": overrides.get("EXPERIMENT_TIER"),
+        "base_experiment_id": overrides.get("BASE_EXPERIMENT_ID"),
+        "base_experiment_label": overrides.get("BASE_EXPERIMENT_LABEL"),
+        "parent_experiment_id": overrides.get("PARENT_EXPERIMENT_ID"),
+        "parent_experiment_label": overrides.get("PARENT_EXPERIMENT_LABEL"),
+        "parent_sweep_round": overrides.get("PARENT_SWEEP_ROUND"),
+        "experiment_notes": overrides.get("EXPERIMENT_NOTES"),
         "status": status,
         "return_code": return_code,
         "winner_name": postprocess_data.get("winner_name"),
-        "config_chunk_length_s": overrides.get("CHUNK_LENGTH_S"),
-        "config_use_overlap": overrides.get("USE_OVERLAP"),
-        "config_overlap_s": overrides.get("OVERLAP_S"),
-        "config_use_class_weights": overrides.get("USE_CLASS_WEIGHTS"),
-        "config_use_data_augmentation": overrides.get("USE_DATA_AUGMENTATION"),
-        "config_use_pitch_shift_augmentation": overrides.get(
-            "USE_PITCH_SHIFT_AUGMENTATION"
+        "config_chunk_length_s": postprocess_data.get(
+            "chunk_length_s",
+            overrides.get("CHUNK_LENGTH_S"),
         ),
-        "config_use_spectral_eq_augmentation": overrides.get(
-            "USE_SPECTRAL_EQ_AUGMENTATION"
+        "config_use_overlap": postprocess_data.get(
+            "use_overlap",
+            overrides.get("USE_OVERLAP"),
         ),
-        "config_eq_augmentation_prob": overrides.get("EQ_AUGMENTATION_PROB"),
-        "config_augmentation_apply_prob": overrides.get("AUGMENTATION_APPLY_PROB"),
-        "config_augmentation_extra_copies": overrides.get(
-            "AUGMENTATION_EXTRA_COPIES"
+        "config_overlap_s": postprocess_data.get(
+            "overlap_s",
+            overrides.get("OVERLAP_S"),
         ),
-        "recommended_chunk_threshold": postprocess_data.get("recommended_chunk_threshold"),
+        "config_use_class_weights": postprocess_data.get(
+            "use_class_weights",
+            overrides.get("USE_CLASS_WEIGHTS"),
+        ),
+        "config_use_data_augmentation": postprocess_data.get(
+            "use_data_augmentation",
+            overrides.get("USE_DATA_AUGMENTATION"),
+        ),
+        "config_use_pitch_shift_augmentation": postprocess_data.get(
+            "use_pitch_shift_augmentation",
+            overrides.get("USE_PITCH_SHIFT_AUGMENTATION"),
+        ),
+        "config_use_spectral_eq_augmentation": postprocess_data.get(
+            "use_spectral_eq_augmentation",
+            overrides.get("USE_SPECTRAL_EQ_AUGMENTATION"),
+        ),
+        "config_eq_augmentation_prob": postprocess_data.get(
+            "eq_augmentation_probability",
+            overrides.get("EQ_AUGMENTATION_PROB"),
+        ),
+        "config_augmentation_apply_prob": postprocess_data.get(
+            "augmentation_apply_prob",
+            overrides.get("AUGMENTATION_APPLY_PROB"),
+        ),
+        "config_augmentation_extra_copies": postprocess_data.get(
+            "augmentation_extra_copies",
+            overrides.get("AUGMENTATION_EXTRA_COPIES"),
+        ),
+        "config_target_false_alarms_per_min": postprocess_data.get(
+            "target_false_alarms_per_min",
+            overrides.get(
+                "TARGET_FALSE_ALARMS_PER_MIN",
+                FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+            ),
+        ),
+        "config_rf_n_estimators": overrides.get(
+            "RF_N_ESTIMATORS",
+            DEFAULT_RF_N_ESTIMATORS,
+        ),
+        "config_svm_c": overrides.get("SVM_C", DEFAULT_SVM_C),
+        "config_svm_gamma": overrides.get("SVM_GAMMA", DEFAULT_SVM_GAMMA),
+        "config_knn_neighbors": overrides.get(
+            "KNN_NEIGHBORS",
+            DEFAULT_KNN_NEIGHBORS,
+        ),
+        "recommended_chunk_threshold": postprocess_data.get(
+            "recommended_chunk_threshold"
+        ),
         "bundle_path": postprocess_data.get("bundle_path"),
+        "saved_bundles": postprocess_data.get("saved_bundles"),
         "run_output_dir": postprocess_data.get("run_output_dir"),
         "postprocess_json_path": postprocess_data.get("postprocess_json_path"),
         "log_path": str(log_path),
@@ -214,10 +494,10 @@ def stream_process_output(process, log_path):
                 print(line, end="")
 
 
-def find_new_postprocess_json(artifacts_dir, run_name_prefix, previous_matches):
+def find_new_postprocess_json(output_dir, run_name_prefix, previous_matches):
     current_matches = set(
         path.resolve()
-        for path in artifacts_dir.glob(f"{run_name_prefix}_*_postprocesado.json")
+        for path in output_dir.glob(f"{run_name_prefix}_*_postprocesado.json")
     )
     new_matches = sorted(current_matches - previous_matches)
     if not new_matches:
@@ -243,15 +523,16 @@ def rank_rows(rows):
     return successful_rows
 
 
-def save_summary_files(output_dir, rows):
-    csv_path = output_dir / "resumen_experimentos.csv"
-    json_path = output_dir / "resumen_experimentos.json"
+def save_summary_files(output_dir, rows, base_name="resumen_experimentos"):
+    csv_path = output_dir / f"{base_name}.csv"
+    json_path = output_dir / f"{base_name}.json"
 
     fieldnames = list(rows[0].keys()) if rows else []
     with open(csv_path, "w", encoding="utf-8", newline="") as csv_handle:
         writer = csv.DictWriter(csv_handle, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        if rows:
+            writer.writerows(rows)
 
     with open(json_path, "w", encoding="utf-8") as json_handle:
         json.dump(rows, json_handle, indent=2)
@@ -259,24 +540,412 @@ def save_summary_files(output_dir, rows):
     return csv_path, json_path
 
 
-if __name__ == "__main__":
-    run_group_name = datetime.now().strftime("barrido_clasif_trad_%Y%m%d_%H%M%S")
-    run_group_dir = SCRIPT_DIR / run_group_name
-    configs_dir = run_group_dir / "configs"
-    logs_dir = run_group_dir / "logs"
-    artifacts_dir = run_group_dir / "artefactos"
+def get_best_result_for_group(ranked_rows, predicate):
+    for row in ranked_rows:
+        if predicate(row):
+            return row
+    return None
+
+
+def select_refinement_parents(ranked_rows, max_parents):
+    selected_rows = []
+    seen_signatures = set()
+    covered_base_experiment_ids = set()
+
+    def try_add_row(row):
+        signature = build_experiment_signature_from_row(row)
+        if signature in seen_signatures:
+            return False
+        selected_rows.append(row)
+        seen_signatures.add(signature)
+        base_experiment_id = row.get("base_experiment_id")
+        if base_experiment_id:
+            covered_base_experiment_ids.add(base_experiment_id)
+        return True
+
+    if ranked_rows:
+        try_add_row(ranked_rows[0])
+
+    for row in ranked_rows:
+        if len(selected_rows) >= max_parents:
+            break
+        base_experiment_id = row.get("base_experiment_id")
+        if base_experiment_id and base_experiment_id not in covered_base_experiment_ids:
+            try_add_row(row)
+
+    for row in ranked_rows:
+        if len(selected_rows) >= max_parents:
+            break
+        try_add_row(row)
+
+    return selected_rows[:max_parents]
+
+
+def build_refinement_mutations(parent_row):
+    parent_overrides = derive_overrides_from_row(parent_row)
+    current_chunk_length_s = float(parent_overrides["CHUNK_LENGTH_S"])
+    current_use_overlap = bool(parent_overrides["USE_OVERLAP"])
+    current_overlap_s = float(parent_overrides["OVERLAP_S"])
+    current_use_class_weights = bool(parent_overrides["USE_CLASS_WEIGHTS"])
+    current_use_augmentation = bool(parent_overrides["USE_DATA_AUGMENTATION"])
+    current_augmentation_prob = float(
+        parent_overrides.get("AUGMENTATION_APPLY_PROB", 0.5)
+    )
+    current_augmentation_copies = int(
+        parent_overrides.get("AUGMENTATION_EXTRA_COPIES", 1)
+    )
+    current_use_pitch_shift = bool(
+        parent_overrides.get("USE_PITCH_SHIFT_AUGMENTATION", True)
+    )
+    current_use_spectral_eq = bool(
+        parent_overrides.get("USE_SPECTRAL_EQ_AUGMENTATION", True)
+    )
+    current_eq_probability = float(
+        parent_overrides.get(
+            "EQ_AUGMENTATION_PROB",
+            FIXED_OVERRIDES["EQ_AUGMENTATION_PROB"],
+        )
+    )
+    current_target_false_alarms = float(
+        parent_overrides.get(
+            "TARGET_FALSE_ALARMS_PER_MIN",
+            FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+        )
+    )
+
+    target_chunk_length_s = (
+        CORE_CHUNK_LENGTHS_S[1]
+        if current_chunk_length_s < 0.75
+        else CORE_CHUNK_LENGTHS_S[0]
+    )
+    target_overlap_s = (
+        OVERLAP_CANDIDATES_S[1]
+        if float_close(current_overlap_s, OVERLAP_CANDIDATES_S[0])
+        else OVERLAP_CANDIDATES_S[0]
+    )
+
+    mutations = [
+        (
+            f"chunk_{seconds_tag(target_chunk_length_s)}",
+            {"CHUNK_LENGTH_S": target_chunk_length_s},
+            "Cambia la duracion del chunk manteniendo el resto constante.",
+        ),
+        (
+            "overlap_off"
+            if current_use_overlap
+            else f"overlap_{seconds_tag(OVERLAP_CANDIDATES_S[0])}",
+            (
+                {"USE_OVERLAP": False}
+                if current_use_overlap
+                else {
+                    "USE_OVERLAP": True,
+                    "OVERLAP_S": OVERLAP_CANDIDATES_S[0],
+                }
+            ),
+            "Invierte el uso de overlap para medir su impacto local.",
+        ),
+        (
+            f"overlap_{seconds_tag(target_overlap_s)}",
+            {
+                "USE_OVERLAP": True,
+                "OVERLAP_S": target_overlap_s,
+            },
+            "Mantiene overlap activado pero cambia su intensidad.",
+        ),
+        (
+            "weights_off" if current_use_class_weights else "weights_on",
+            {"USE_CLASS_WEIGHTS": not current_use_class_weights},
+            "Invierte el uso de class weights para revisar si realmente ayudan.",
+        ),
+    ]
+
+    if current_use_augmentation:
+        for probability in AUGMENTATION_PROB_CANDIDATES:
+            if not float_close(current_augmentation_prob, probability):
+                mutations.append(
+                    (
+                        f"aug_p{prob_tag(probability)}",
+                        {"AUGMENTATION_APPLY_PROB": probability},
+                        "Ajusta la probabilidad de augmentacion.",
+                    )
+                )
+
+        for copies in AUGMENTATION_EXTRA_COPIES_CANDIDATES:
+            if current_augmentation_copies != copies:
+                mutations.append(
+                    (
+                        f"aug_copies_{copies}",
+                        {"AUGMENTATION_EXTRA_COPIES": copies},
+                        "Ajusta el numero de copias augmentadas por chunk.",
+                    )
+                )
+
+        mutations.append(
+            (
+                "pitch_off" if current_use_pitch_shift else "pitch_on",
+                {"USE_PITCH_SHIFT_AUGMENTATION": not current_use_pitch_shift},
+                "Invierte el pitch shift dentro de la augmentacion.",
+            )
+        )
+
+        if current_use_spectral_eq:
+            mutations.append(
+                (
+                    "eq_off",
+                    {"USE_SPECTRAL_EQ_AUGMENTATION": False},
+                    "Desactiva la EQ para aislar su efecto dentro de la augmentacion.",
+                )
+            )
+            for probability in EQ_AUGMENTATION_PROB_CANDIDATES:
+                if not float_close(current_eq_probability, probability):
+                    mutations.append(
+                        (
+                            f"eq_p{prob_tag(probability)}",
+                            {"EQ_AUGMENTATION_PROB": probability},
+                            "Ajusta la frecuencia de la EQ espectral.",
+                        )
+                    )
+        else:
+            mutations.append(
+                (
+                    "eq_on_p10",
+                    {
+                        "USE_SPECTRAL_EQ_AUGMENTATION": True,
+                        "EQ_AUGMENTATION_PROB": EQ_AUGMENTATION_PROB_CANDIDATES[0],
+                    },
+                    "Reactiva la EQ con una probabilidad suave.",
+                )
+            )
+    else:
+        mutations.extend(
+            [
+                (
+                    "augment_p35",
+                    {
+                        "USE_DATA_AUGMENTATION": True,
+                        "AUGMENTATION_APPLY_PROB": AUGMENTATION_PROB_CANDIDATES[0],
+                        "AUGMENTATION_EXTRA_COPIES": 1,
+                        "USE_PITCH_SHIFT_AUGMENTATION": False,
+                        "USE_SPECTRAL_EQ_AUGMENTATION": True,
+                        "EQ_AUGMENTATION_PROB": EQ_AUGMENTATION_PROB_CANDIDATES[0],
+                    },
+                    "Activa una augmentacion suave como primer salto de robustez.",
+                ),
+                (
+                    "augment_p65",
+                    {
+                        "USE_DATA_AUGMENTATION": True,
+                        "AUGMENTATION_APPLY_PROB": AUGMENTATION_PROB_CANDIDATES[1],
+                        "AUGMENTATION_EXTRA_COPIES": 1,
+                        "USE_PITCH_SHIFT_AUGMENTATION": True,
+                        "USE_SPECTRAL_EQ_AUGMENTATION": True,
+                        "EQ_AUGMENTATION_PROB": FIXED_OVERRIDES["EQ_AUGMENTATION_PROB"],
+                    },
+                    "Activa una augmentacion mas intensa para medir robustez.",
+                ),
+            ]
+        )
+
+    for target_false_alarms in TARGET_FALSE_ALARMS_CANDIDATES:
+        if not float_close(current_target_false_alarms, target_false_alarms):
+            mutations.append(
+                (
+                    f"fa_{prob_tag(target_false_alarms)}",
+                    {"TARGET_FALSE_ALARMS_PER_MIN": target_false_alarms},
+                    "Cambia la restriccion de falsas alarmas por minuto usada al calibrar.",
+                )
+            )
+
+    return mutations
+
+
+def make_refinement_experiment(parent_row, round_number, label_suffix, extra_overrides, notes):
+    base_overrides = derive_overrides_from_row(parent_row)
+    merged_overrides = dict(base_overrides)
+    merged_overrides.update(extra_overrides)
+
+    chunk_length_s = float(
+        merged_overrides.get("CHUNK_LENGTH_S", FIXED_OVERRIDES["CHUNK_LENGTH_S"])
+    )
+    overlap_s = float(
+        merged_overrides.get("OVERLAP_S", FIXED_OVERRIDES["OVERLAP_S"])
+    )
+    if not normalize_optional_bool(merged_overrides.get("USE_OVERLAP"), False):
+        overlap_s = FIXED_OVERRIDES["OVERLAP_S"]
+
+    parent_round = int(parent_row.get("sweep_round") or max(1, round_number - 1))
+    base_experiment_id = parent_row.get("base_experiment_id") or "derived"
+    experiment_label = (
+        f"{base_experiment_id}_r{round_number:02d}_"
+        f"from_r{parent_round:02d}_{parent_row['experiment_id']}_{label_suffix}"
+    )
+
+    overrides = {
+        "EXPERIMENT_LABEL": experiment_label,
+        "EXPERIMENT_TIER": f"refine_r{round_number:02d}",
+        "BASE_EXPERIMENT_ID": parent_row.get("base_experiment_id"),
+        "BASE_EXPERIMENT_LABEL": parent_row.get("base_experiment_label"),
+        "PARENT_EXPERIMENT_ID": parent_row.get("experiment_id"),
+        "PARENT_EXPERIMENT_LABEL": parent_row.get("experiment_label"),
+        "PARENT_SWEEP_ROUND": parent_row.get("sweep_round"),
+        "EXPERIMENT_NOTES": (
+            f"Refinamiento automatico desde {parent_row['experiment_label']} "
+            f"(ronda {parent_round}). {notes}"
+        ),
+    }
+    overrides.update(merged_overrides)
+    overrides["CHUNK_LENGTH_S"] = chunk_length_s
+    overrides["OVERLAP_S"] = overlap_s
+    return overrides
+
+
+def build_refinement_experiment_grid(parent_rows, seen_signatures, round_number):
+    refinement_experiments = []
+    round_signatures = set()
+
+    for parent_row in parent_rows:
+        children_added = 0
+        for label_suffix, extra_overrides, notes in build_refinement_mutations(parent_row):
+            experiment = make_refinement_experiment(
+                parent_row=parent_row,
+                round_number=round_number,
+                label_suffix=label_suffix,
+                extra_overrides=extra_overrides,
+                notes=notes,
+            )
+            signature = build_experiment_signature_from_overrides(experiment)
+            if signature in seen_signatures or signature in round_signatures:
+                continue
+
+            refinement_experiments.append(experiment)
+            round_signatures.add(signature)
+            children_added += 1
+
+            if children_added >= REFINEMENT_MAX_CHILDREN_PER_PARENT:
+                break
+
+    return refinement_experiments
+
+
+def save_round_report(round_dir, round_number, round_rows, ranked_rows, selected_parents, next_round_grid):
+    report_path = round_dir / "reporte_ronda.md"
+    successful_rows = [row for row in round_rows if row["status"] == "ok"]
+    failed_rows = [row for row in round_rows if row["status"] != "ok"]
+    report_lines = [
+        f"# Reporte ronda {round_number:02d}",
+        "",
+        f"- Experimentos lanzados: {len(round_rows)}",
+        f"- Experimentos exitosos: {len(successful_rows)}",
+        f"- Experimentos con error o sin JSON: {len(failed_rows)}",
+    ]
+
+    if ranked_rows:
+        best_row = ranked_rows[0]
+        report_lines.extend(
+            [
+                f"- Mejor experimento: {format_row_compact(best_row)}",
+                "",
+                f"## Top {min(ROUND_REPORT_TOP_N, len(ranked_rows))}",
+            ]
+        )
+        for rank, row in enumerate(ranked_rows[:ROUND_REPORT_TOP_N], start=1):
+            report_lines.append(f"{rank}. {format_row_compact(row)}")
+
+        report_lines.extend(["", "## Mejores por grupo"])
+        group_definitions = [
+            ("Semillas iniciales", lambda row: row["experiment_tier"] == "seed"),
+            (
+                "Refinamiento actual",
+                lambda row: str(row["experiment_tier"]).startswith("refine_"),
+            ),
+        ]
+        for title, predicate in group_definitions:
+            best_group_row = get_best_result_for_group(ranked_rows, predicate)
+            if best_group_row is not None:
+                report_lines.append(f"- {title}: {format_row_compact(best_group_row)}")
+    else:
+        report_lines.extend(["", "No hay experimentos exitosos en esta ronda."])
+
+    if selected_parents:
+        report_lines.extend(["", "## Padres elegidos para la siguiente ronda"])
+        for rank, row in enumerate(selected_parents, start=1):
+            report_lines.append(f"{rank}. {format_row_compact(row)}")
+
+    if next_round_grid is not None:
+        report_lines.extend(
+            [
+                "",
+                "## Siguiente ronda automatica",
+                f"- Configuraciones nuevas generadas: {len(next_round_grid)}",
+            ]
+        )
+        for experiment in next_round_grid[:ROUND_REPORT_TOP_N]:
+            report_lines.append(
+                f"- {experiment['EXPERIMENT_LABEL']} | "
+                f"chunk={experiment.get('CHUNK_LENGTH_S')} s | "
+                f"overlap={experiment.get('USE_OVERLAP')} | "
+                f"weights={experiment.get('USE_CLASS_WEIGHTS')} | "
+                f"augment={experiment.get('USE_DATA_AUGMENTATION')}"
+            )
+
+    with open(report_path, "w", encoding="utf-8") as report_handle:
+        report_handle.write("\n".join(report_lines) + "\n")
+
+    return report_path
+
+
+def save_global_report(run_group_dir, all_rows, round_results):
+    report_path = run_group_dir / "reporte_global.md"
+    ranked_rows = rank_rows(all_rows)
+    report_lines = [
+        "# Reporte global del barrido iterativo",
+        "",
+        f"- Rondas ejecutadas: {len(round_results)}",
+        f"- Experimentos totales: {len(all_rows)}",
+        f"- Experimentos exitosos: {len(ranked_rows)}",
+    ]
+
+    report_lines.extend(["", "## Resumen por ronda"])
+    for round_result in round_results:
+        round_rows = round_result["rows"]
+        round_ranked_rows = round_result["ranked_rows"]
+        report_lines.append(
+            f"- Ronda {round_result['round_number']:02d}: "
+            f"{len(round_rows)} experimentos, "
+            f"{len(round_ranked_rows)} exitosos, "
+            f"dir={round_result['round_dir']}"
+        )
+        if round_ranked_rows:
+            report_lines.append(f"  Mejor: {format_row_compact(round_ranked_rows[0])}")
+
+    if ranked_rows:
+        report_lines.extend(["", f"## Top {min(ROUND_REPORT_TOP_N, len(ranked_rows))} global"])
+        for rank, row in enumerate(ranked_rows[:ROUND_REPORT_TOP_N], start=1):
+            report_lines.append(f"{rank}. {format_row_compact(row)}")
+
+    with open(report_path, "w", encoding="utf-8") as report_handle:
+        report_handle.write("\n".join(report_lines) + "\n")
+
+    return report_path
+
+
+def execute_round(experiment_grid, round_number, run_group_dir):
+    if MAX_EXPERIMENTS is not None:
+        experiment_grid = experiment_grid[:MAX_EXPERIMENTS]
+
+    round_dir = run_group_dir / build_round_dir_name(round_number)
+    configs_dir = round_dir / "configs"
+    logs_dir = round_dir / "logs"
+    artifacts_dir = round_dir / "artefactos"
 
     configs_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    experiment_grid = build_experiment_grid()
-    if MAX_EXPERIMENTS is not None:
-        experiment_grid = experiment_grid[:MAX_EXPERIMENTS]
-
+    print("\n" + "#" * 80)
+    print(f"Ronda {round_number:02d}")
     print(f"Script de entrenamiento: {TRAINING_SCRIPT_PATH}")
-    print(f"Comando Python: {' '.join(PYTHON_COMMAND)}")
-    print(f"Directorio del barrido: {run_group_dir}")
+    print(f"Directorio de la ronda: {round_dir}")
     print(f"Numero de experimentos a ejecutar: {len(experiment_grid)}")
 
     all_rows = []
@@ -288,7 +957,10 @@ if __name__ == "__main__":
 
         applied_overrides = dict(FIXED_OVERRIDES)
         applied_overrides.update(experiment_overrides)
-        applied_overrides["RUN_OUTPUT_DIR"] = str(artifacts_dir)
+
+        experiment_output_dir = artifacts_dir / run_name_prefix
+        experiment_output_dir.mkdir(parents=True, exist_ok=True)
+        applied_overrides["RUN_OUTPUT_DIR"] = str(experiment_output_dir)
         applied_overrides["RUN_NAME_PREFIX"] = run_name_prefix
 
         config_path = configs_dir / f"{experiment_id}.json"
@@ -303,7 +975,7 @@ if __name__ == "__main__":
 
         previous_matches = set(
             path.resolve()
-            for path in artifacts_dir.glob(f"{run_name_prefix}_*_postprocesado.json")
+            for path in experiment_output_dir.glob(f"{run_name_prefix}_*_postprocesado.json")
         )
 
         process_env = os.environ.copy()
@@ -324,16 +996,16 @@ if __name__ == "__main__":
         return_code = process.wait()
 
         postprocess_json_path = find_new_postprocess_json(
-            artifacts_dir,
+            experiment_output_dir,
             run_name_prefix,
             previous_matches,
         )
 
         if return_code != 0:
             row = build_summary_row(
-                experiment_id,
-                applied_overrides,
-                {
+                experiment_id=experiment_id,
+                overrides=applied_overrides,
+                postprocess_data={
                     "postprocess_json_path": (
                         str(postprocess_json_path) if postprocess_json_path else None
                     )
@@ -341,6 +1013,8 @@ if __name__ == "__main__":
                 status="failed",
                 return_code=return_code,
                 log_path=log_path,
+                sweep_round=round_number,
+                round_dir=round_dir,
             )
             all_rows.append(row)
             print(f"El experimento {experiment_id} ha fallado con codigo {return_code}.")
@@ -351,12 +1025,14 @@ if __name__ == "__main__":
 
         if postprocess_json_path is None:
             row = build_summary_row(
-                experiment_id,
-                applied_overrides,
-                {},
+                experiment_id=experiment_id,
+                overrides=applied_overrides,
+                postprocess_data={},
                 status="missing_json",
                 return_code=return_code,
                 log_path=log_path,
+                sweep_round=round_number,
+                round_dir=round_dir,
             )
             all_rows.append(row)
             print(
@@ -372,36 +1048,139 @@ if __name__ == "__main__":
         postprocess_data["postprocess_json_path"] = str(postprocess_json_path)
 
         row = build_summary_row(
-            experiment_id,
-            applied_overrides,
-            postprocess_data,
+            experiment_id=experiment_id,
+            overrides=applied_overrides,
+            postprocess_data=postprocess_data,
             status="ok",
             return_code=return_code,
             log_path=log_path,
+            sweep_round=round_number,
+            round_dir=round_dir,
         )
         all_rows.append(row)
 
     ranked_rows = rank_rows(all_rows)
-    csv_path, json_path = save_summary_files(run_group_dir, all_rows)
+    csv_path, json_path = save_summary_files(round_dir, all_rows)
 
     print("\n" + "=" * 80)
     print(f"Resumen CSV guardado en: {csv_path}")
     print(f"Resumen JSON guardado en: {json_path}")
 
     if ranked_rows:
-        best_row = ranked_rows[0]
-        print("\nMejor experimento segun validation_refit_f2:")
-        print(json.dumps(best_row, indent=2))
+        print("\nMejor experimento de la ronda:")
+        print(format_row_compact(ranked_rows[0]))
 
-        print("\nTop 5 experimentos:")
-        for row in ranked_rows[:5]:
-            print(
-                f"{row['experiment_id']} ({row['experiment_label']}) | "
-                f"winner={row['winner_name']} | "
-                f"val_refit_f2={safe_metric(row, 'validation_refit_f2', default=0.0):.4f} | "
-                f"val_refit_recall={safe_metric(row, 'validation_refit_recall', default=0.0):.4f} | "
-                f"val_refit_auc_pr={safe_metric(row, 'validation_refit_auc_pr', default=0.0):.4f} | "
-                f"false_alarms/min={safe_metric(row, 'validation_refit_false_alarms_per_min', default=0.0):.2f}"
-            )
+        print(f"\nTop {min(ROUND_REPORT_TOP_N, len(ranked_rows))} de la ronda:")
+        for rank, row in enumerate(ranked_rows[:ROUND_REPORT_TOP_N], start=1):
+            print(format_row_compact(row, rank=rank))
     else:
-        print("\nNo hay experimentos exitosos para comparar.")
+        print("\nNo hay experimentos exitosos para comparar en esta ronda.")
+
+    return {
+        "round_number": round_number,
+        "round_dir": round_dir,
+        "experiment_grid": experiment_grid,
+        "rows": all_rows,
+        "ranked_rows": ranked_rows,
+        "csv_path": csv_path,
+        "json_path": json_path,
+    }
+
+
+if __name__ == "__main__":
+    run_group_name = datetime.now().strftime(
+        "barrido_clasif_trad_iterativo_%Y%m%d_%H%M%S"
+    )
+    run_group_dir = SCRIPT_DIR / run_group_name
+    run_group_dir.mkdir(parents=True, exist_ok=True)
+
+    current_experiment_grid = build_experiment_grid()
+    all_rows_global = []
+    round_results = []
+    seen_signatures = set()
+
+    print(f"Directorio raiz del barrido: {run_group_dir}")
+    print(
+        "Modo iterativo: "
+        f"{AUTO_ITERATIVE_REFINEMENT} | max rondas: {MAX_SWEEP_ROUNDS} | "
+        f"top padres: {REFINEMENT_TOP_K}"
+    )
+
+    for round_number in range(1, MAX_SWEEP_ROUNDS + 1):
+        if not current_experiment_grid:
+            print("\nNo hay configuraciones nuevas que ejecutar. Fin del barrido.")
+            break
+
+        round_result = execute_round(
+            experiment_grid=current_experiment_grid,
+            round_number=round_number,
+            run_group_dir=run_group_dir,
+        )
+        round_results.append(round_result)
+        all_rows_global.extend(round_result["rows"])
+
+        for experiment in round_result["experiment_grid"]:
+            seen_signatures.add(build_experiment_signature_from_overrides(experiment))
+
+        selected_parents = []
+        next_round_grid = None
+
+        if AUTO_ITERATIVE_REFINEMENT and round_number < MAX_SWEEP_ROUNDS:
+            selected_parents = select_refinement_parents(
+                round_result["ranked_rows"],
+                max_parents=REFINEMENT_TOP_K,
+            )
+            next_round_grid = build_refinement_experiment_grid(
+                parent_rows=selected_parents,
+                seen_signatures=seen_signatures,
+                round_number=round_number + 1,
+            )
+
+        round_report_path = save_round_report(
+            round_dir=round_result["round_dir"],
+            round_number=round_number,
+            round_rows=round_result["rows"],
+            ranked_rows=round_result["ranked_rows"],
+            selected_parents=selected_parents,
+            next_round_grid=next_round_grid,
+        )
+        print(f"\nReporte de ronda guardado en: {round_report_path}")
+
+        if not AUTO_ITERATIVE_REFINEMENT or round_number >= MAX_SWEEP_ROUNDS:
+            break
+
+        if not next_round_grid:
+            print(
+                "\nNo se han generado configuraciones nuevas para la siguiente ronda. "
+                "Fin del barrido iterativo."
+            )
+            break
+
+        print(
+            f"\nArrancando automaticamente la ronda {round_number + 1:02d} "
+            f"con {len(next_round_grid)} nuevas configuraciones..."
+        )
+        current_experiment_grid = next_round_grid
+
+    global_csv_path, global_json_path = save_summary_files(
+        run_group_dir,
+        all_rows_global,
+        base_name="resumen_global",
+    )
+    global_report_path = save_global_report(
+        run_group_dir=run_group_dir,
+        all_rows=all_rows_global,
+        round_results=round_results,
+    )
+
+    print("\n" + "#" * 80)
+    print(f"Resumen global CSV guardado en: {global_csv_path}")
+    print(f"Resumen global JSON guardado en: {global_json_path}")
+    print(f"Reporte global guardado en: {global_report_path}")
+
+    global_ranked_rows = rank_rows(all_rows_global)
+    if global_ranked_rows:
+        print("\nMejor experimento global:")
+        print(format_row_compact(global_ranked_rows[0]))
+    else:
+        print("\nNo hay experimentos exitosos en el barrido iterativo.")
