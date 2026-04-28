@@ -1,0 +1,11 @@
+/* src/index.css */
+@import "tailwindcss";
+
+/* Este extra es para que el fondo siempre sea negro tecnológico 
+   y las letras claras, como en el diseño original */
+body {
+  background-color: #020408;
+  color: #cbd5e1; /* esto es slate-200 */
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+}

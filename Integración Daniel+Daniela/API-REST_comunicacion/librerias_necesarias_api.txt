@@ -1,0 +1,9 @@
+### 🌐 1. El Cerebro Web (La API Central)
+Estas son las librerías encargadas de mantener la memoria en tiempo real, gestionar los WebSockets y servir los datos a la pantalla sin latencia.
+
+* **`fastapi`**: El framework de desarrollo web asíncrono. Es la estructura que nos permite crear los endpoints (`GET`, `POST`) y definir los modelos de datos de forma estricta.
+* **`uvicorn`**: El motor de alto rendimiento (servidor ASGI). FastAPI es solo el "plano" del edificio, Uvicorn es la "electricidad" que lo mantiene vivo y procesando cientos de peticiones por segundo.
+* **Comando de instalación:** - importante ejecutarlo dentro del entorno virtual
+    
+    pip install fastapi uvicorn
+    

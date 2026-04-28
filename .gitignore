@@ -23,3 +23,17 @@ DataSet Camilo y Daniela/HPC/train_margin_3_gpu_array.sbatch
 !DataSet Camilo y Daniela/dataset/
 !DataSet Camilo y Daniela/dataset/metadata/
 !DataSet Camilo y Daniela/dataset/metadata/master_index.csv
+!Integración Daniel+Daniela/
+Integración Daniel+Daniela/*
+!Integración Daniel+Daniela/API-REST_comunicacion/
+!Integración Daniel+Daniela/API-REST_comunicacion/**
+!Integración Daniel+Daniela/DATA-acquisition/
+!Integración Daniel+Daniela/DATA-acquisition/**
+!Integración Daniel+Daniela/UI-SIRA/
+!Integración Daniel+Daniela/UI-SIRA/**
+!Integración Daniel+Daniela/Integración Sistema.docx
+Integración Daniel+Daniela/UI-SIRA/node_modules/
+Integración Daniel+Daniela/UI-SIRA/dist/
+Integración Daniel+Daniela/UI-SIRA/dist-ssr/
+Integración Daniel+Daniela/UI-SIRA/.vite/
+Integración Daniel+Daniela/UI-SIRA/.vite-temp/
