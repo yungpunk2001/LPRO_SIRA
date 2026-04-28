@@ -34,6 +34,8 @@ DEFAULT_CHUNK_SEC = 0.5
 DEFAULT_OVERLAP_SEC = 0.125
 DEFAULT_N_MFCC = 13
 DEFAULT_TARGET_FALSE_ALARMS_PER_MIN = 1.0
+DEFAULT_TARGET_FALSE_ALARM_EPISODES_PER_MIN = DEFAULT_TARGET_FALSE_ALARMS_PER_MIN
+DEFAULT_MIN_EVENT_HIT_DURATION_S = 1.0
 FEATURE_VECTOR_SIZE = 50
 DEFAULT_EQ_AUGMENTATION_PROB = 0.20
 DEFAULT_EQ_ONE_FILTER_PROB = 0.70
@@ -70,6 +72,51 @@ def build_model_bundle_path(
 ) -> Path:
     output_dir = resolve_output_dir(output_dir)
     return output_dir / f"clasificador_tradicional_{model_name_to_slug(model_name)}_bundle.joblib"
+
+
+def chunk_count_to_duration_s(
+    num_chunks: int,
+    chunk_length_s: float = DEFAULT_CHUNK_SEC,
+    chunk_step_s: float = DEFAULT_CHUNK_SEC - DEFAULT_OVERLAP_SEC,
+) -> float:
+    if num_chunks <= 0:
+        return 0.0
+    return float(chunk_length_s + max(0, int(num_chunks) - 1) * chunk_step_s)
+
+
+def compute_positive_run_lengths(binary_sequence: np.ndarray | Sequence[int]) -> np.ndarray:
+    binary_array = np.asarray(binary_sequence, dtype=np.int32).reshape(-1)
+    if binary_array.size == 0:
+        return np.array([], dtype=np.int32)
+
+    padded = np.pad(binary_array, (1, 1), mode="constant", constant_values=0)
+    transitions = np.diff(padded)
+    run_starts = np.where(transitions == 1)[0]
+    run_ends = np.where(transitions == -1)[0]
+    return (run_ends - run_starts).astype(np.int32)
+
+
+def count_positive_episodes(
+    binary_sequence: np.ndarray | Sequence[int],
+    min_duration_s: float = DEFAULT_MIN_EVENT_HIT_DURATION_S,
+    chunk_length_s: float = DEFAULT_CHUNK_SEC,
+    chunk_step_s: float = DEFAULT_CHUNK_SEC - DEFAULT_OVERLAP_SEC,
+) -> int:
+    run_lengths = compute_positive_run_lengths(binary_sequence)
+    if run_lengths.size == 0:
+        return 0
+
+    qualifying_runs = [
+        run_length
+        for run_length in run_lengths
+        if chunk_count_to_duration_s(
+            int(run_length),
+            chunk_length_s=chunk_length_s,
+            chunk_step_s=chunk_step_s,
+        )
+        >= min_duration_s
+    ]
+    return int(len(qualifying_runs))
 
 
 def resolve_output_dir(output_dir: Path | str | None = None) -> Path:
@@ -954,11 +1001,14 @@ def build_dataset_in_memory(
     eq_high_shelf_cutoff_hz_range: Sequence[float] = DEFAULT_EQ_HIGH_SHELF_CUTOFF_HZ_RANGE,
     eq_bell_bandwidth_octaves_range: Sequence[float] = DEFAULT_EQ_BELL_BANDWIDTH_OCTAVES_RANGE,
     eq_shelf_sharpness_range: Sequence[float] = DEFAULT_EQ_SHELF_SHARPNESS_RANGE,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_audio_records: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, list[dict]]:
     base_path = Path(base_path)
     x_list: list[np.ndarray] = []
     y_list: list[np.ndarray] = []
+    audio_records: list[dict] = []
     rng = np.random.default_rng(random_seed) if augment else None
+    running_offset = 0
 
     for row in df.itertuples(index=False):
         audio_path = base_path / row.path
@@ -989,14 +1039,44 @@ def build_dataset_in_memory(
 
         x_list.append(fragments)
         y_list.append(np.full(len(fragments), row.target, dtype=np.int32))
+        if return_audio_records:
+            audio_records.append(
+                {
+                    "path": str(row.path),
+                    "label": str(getattr(row, "label", "")).strip().lower(),
+                    "target": int(row.target),
+                    "source": None
+                    if pd.isna(getattr(row, "source", pd.NA))
+                    else str(getattr(row, "source")).strip(),
+                    "group_id": None
+                    if pd.isna(getattr(row, "group_id", pd.NA))
+                    else str(getattr(row, "group_id")).strip(),
+                    "siren_id": None
+                    if pd.isna(getattr(row, "siren_id", pd.NA))
+                    else str(getattr(row, "siren_id")).strip(),
+                    "safe_group_id": None
+                    if pd.isna(getattr(row, "safe_group_id", pd.NA))
+                    else str(getattr(row, "safe_group_id")).strip(),
+                    "start_index": int(running_offset),
+                    "end_index": int(running_offset + len(fragments)),
+                    "num_chunks": int(len(fragments)),
+                }
+            )
+            running_offset += int(len(fragments))
 
     if not x_list:
-        return (
+        empty_result = (
             np.empty((0, FEATURE_VECTOR_SIZE), dtype=np.float32),
             np.empty((0,), dtype=np.int32),
         )
+        if return_audio_records:
+            return (*empty_result, [])
+        return empty_result
 
-    return np.vstack(x_list), np.hstack(y_list)
+    dataset_result = (np.vstack(x_list), np.hstack(y_list))
+    if return_audio_records:
+        return (*dataset_result, audio_records)
+    return dataset_result
 
 
 def feature_names() -> list[str]:
@@ -1046,6 +1126,10 @@ def compute_detection_metrics(
     y_score_positive: np.ndarray,
     positive_class_encoded: int,
     chunk_step_s: float,
+    audio_prediction_records: list[dict] | None = None,
+    threshold: float | None = None,
+    chunk_length_s: float = DEFAULT_CHUNK_SEC,
+    min_event_hit_duration_s: float = DEFAULT_MIN_EVENT_HIT_DURATION_S,
 ) -> dict[str, float | int | list[list[int]]]:
     y_true_binary = (np.asarray(y_true) == positive_class_encoded).astype(np.int32)
     y_pred_binary = np.asarray(y_pred_binary).astype(np.int32)
@@ -1068,7 +1152,7 @@ def compute_detection_metrics(
     negative_chunks = max(1, int(np.sum(y_true_binary == 0)))
     false_alarms_per_min = (fp / negative_chunks) * (60.0 / chunk_step_s)
 
-    return {
+    metrics = {
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
@@ -1083,14 +1167,224 @@ def compute_detection_metrics(
         "confusion_matrix": matrix.tolist(),
     }
 
+    if audio_prediction_records is not None and threshold is not None:
+        total_positive_events = 0
+        detected_positive_events = 0
+        false_alarm_episode_count = 0
+        background_duration_s = 0.0
+        event_coverages = []
+        positive_scores = np.asarray(y_score_positive, dtype=np.float32).reshape(-1)
+
+        for record in audio_prediction_records:
+            start_index = int(record["start_index"])
+            end_index = int(record["end_index"])
+            if end_index <= start_index:
+                continue
+
+            audio_scores = positive_scores[start_index:end_index]
+            if audio_scores.size == 0:
+                continue
+
+            audio_binary = (audio_scores >= float(threshold)).astype(np.int32)
+            episode_count = count_positive_episodes(
+                audio_binary,
+                min_duration_s=min_event_hit_duration_s,
+                chunk_length_s=chunk_length_s,
+                chunk_step_s=chunk_step_s,
+            )
+
+            if int(record["target"]) == int(positive_class_encoded):
+                total_positive_events += 1
+                event_coverages.append(float(np.mean(audio_binary)))
+                if episode_count > 0:
+                    detected_positive_events += 1
+            else:
+                background_duration_s += chunk_count_to_duration_s(
+                    len(audio_binary),
+                    chunk_length_s=chunk_length_s,
+                    chunk_step_s=chunk_step_s,
+                )
+                false_alarm_episode_count += int(episode_count)
+
+        background_duration_min = background_duration_s / 60.0 if background_duration_s > 0.0 else 0.0
+        false_alarm_episodes_per_min = (
+            float(false_alarm_episode_count / background_duration_min)
+            if background_duration_min > 0.0
+            else 0.0
+        )
+
+        metrics.update(
+            {
+                "event_recall": float(
+                    detected_positive_events / total_positive_events
+                )
+                if total_positive_events > 0
+                else 0.0,
+                "macro_event_coverage": float(np.mean(event_coverages))
+                if event_coverages
+                else 0.0,
+                "detected_positive_event_count": int(detected_positive_events),
+                "total_positive_event_count": int(total_positive_events),
+                "false_alarm_episode_count": int(false_alarm_episode_count),
+                "background_duration_min": float(background_duration_min),
+                "false_alarm_episodes_per_min": float(false_alarm_episodes_per_min),
+                "min_event_hit_duration_s": float(min_event_hit_duration_s),
+            }
+        )
+    else:
+        metrics.update(
+            {
+                "event_recall": float(recall),
+                "macro_event_coverage": float(recall),
+                "detected_positive_event_count": int(tp),
+                "total_positive_event_count": int(tp + fn),
+                "false_alarm_episode_count": int(fp),
+                "background_duration_min": float(negative_chunks * chunk_step_s / 60.0),
+                "false_alarm_episodes_per_min": float(false_alarms_per_min),
+                "min_event_hit_duration_s": float(min_event_hit_duration_s),
+            }
+        )
+
+    return metrics
+
+
+def select_best_threshold_row_from_table(
+    threshold_df: pd.DataFrame,
+    target_false_alarm_episodes_per_min: float,
+) -> tuple[pd.Series, bool]:
+    allowed = threshold_df[
+        threshold_df["false_alarm_episodes_per_min"] <= target_false_alarm_episodes_per_min
+    ]
+
+    if not allowed.empty:
+        best_row = allowed.sort_values(
+            by=["event_recall", "macro_event_coverage", "f2", "recall", "threshold"],
+            ascending=[False, False, False, False, False],
+        ).iloc[0]
+        return best_row, True
+
+    best_row = threshold_df.sort_values(
+        by=[
+            "event_recall",
+            "false_alarm_episodes_per_min",
+            "macro_event_coverage",
+            "f2",
+            "recall",
+            "threshold",
+        ],
+        ascending=[False, True, False, False, False, False],
+    ).iloc[0]
+    return best_row, False
+
+
+def auto_calibrate_false_alarm_episode_limit(
+    threshold_df: pd.DataFrame,
+    requested_limit: float,
+    candidate_limits: Sequence[float],
+    event_recall_retention: float,
+) -> tuple[float, dict]:
+    if threshold_df.empty:
+        empty_info = {
+            "requested_limit": float(requested_limit),
+            "selected_limit": float(requested_limit),
+            "event_recall_retention": float(event_recall_retention),
+            "max_event_recall": 0.0,
+            "min_required_event_recall": 0.0,
+            "selection_reason": "empty_threshold_table",
+            "candidate_summaries": [],
+        }
+        return float(requested_limit), empty_info
+
+    normalized_candidates = {
+        round(float(limit), 6)
+        for limit in candidate_limits
+        if float(limit) > 0.0
+    }
+    normalized_candidates.add(round(float(requested_limit), 6))
+    candidate_limits_sorted = sorted(normalized_candidates)
+
+    retention = max(0.0, min(1.0, float(event_recall_retention)))
+    max_event_recall = float(threshold_df["event_recall"].max())
+    min_required_event_recall = float(retention * max_event_recall)
+
+    candidate_summaries = []
+    for candidate_limit in candidate_limits_sorted:
+        best_row, constraint_satisfied = select_best_threshold_row_from_table(
+            threshold_df,
+            candidate_limit,
+        )
+        candidate_summaries.append(
+            {
+                "candidate_limit": float(candidate_limit),
+                "constraint_satisfied": bool(constraint_satisfied),
+                "selected_threshold": float(best_row["threshold"]),
+                "selected_event_recall": float(best_row["event_recall"]),
+                "selected_macro_event_coverage": float(best_row["macro_event_coverage"]),
+                "selected_f2": float(best_row["f2"]),
+                "selected_recall": float(best_row["recall"]),
+                "selected_false_alarm_episodes_per_min": float(
+                    best_row["false_alarm_episodes_per_min"]
+                ),
+                "selected_false_alarms_per_min": float(best_row["false_alarms_per_min"]),
+                "meets_event_recall_retention": bool(
+                    constraint_satisfied
+                    and float(best_row["event_recall"]) >= (min_required_event_recall - 1e-12)
+                ),
+            }
+        )
+
+    eligible_candidates = [
+        candidate for candidate in candidate_summaries if candidate["meets_event_recall_retention"]
+    ]
+    if eligible_candidates:
+        chosen_candidate = eligible_candidates[0]
+        selection_reason = "smallest_feasible_limit_retaining_target_event_recall"
+    else:
+        feasible_candidates = [
+            candidate for candidate in candidate_summaries if candidate["constraint_satisfied"]
+        ]
+        if feasible_candidates:
+            chosen_candidate = sorted(
+                feasible_candidates,
+                key=lambda candidate: (
+                    -candidate["selected_event_recall"],
+                    -candidate["selected_macro_event_coverage"],
+                    -candidate["selected_f2"],
+                    candidate["candidate_limit"],
+                ),
+            )[0]
+            selection_reason = "best_feasible_limit_by_event_metrics"
+        else:
+            chosen_candidate = {
+                "candidate_limit": float(requested_limit),
+            }
+            selection_reason = "no_feasible_candidate_limit"
+
+    return float(chosen_candidate["candidate_limit"]), {
+        "requested_limit": float(requested_limit),
+        "selected_limit": float(chosen_candidate["candidate_limit"]),
+        "event_recall_retention": float(retention),
+        "max_event_recall": float(max_event_recall),
+        "min_required_event_recall": float(min_required_event_recall),
+        "selection_reason": selection_reason,
+        "candidate_summaries": candidate_summaries,
+    }
+
 
 def select_best_threshold(
     y_true: np.ndarray,
     positive_probs: np.ndarray,
     positive_class_encoded: int,
+    audio_prediction_records: list[dict] | None = None,
     thresholds: np.ndarray | None = None,
     target_false_alarms_per_min: float = DEFAULT_TARGET_FALSE_ALARMS_PER_MIN,
+    target_false_alarm_episodes_per_min: float = DEFAULT_TARGET_FALSE_ALARM_EPISODES_PER_MIN,
     chunk_step_s: float = DEFAULT_CHUNK_SEC - DEFAULT_OVERLAP_SEC,
+    chunk_length_s: float = DEFAULT_CHUNK_SEC,
+    min_event_hit_duration_s: float = DEFAULT_MIN_EVENT_HIT_DURATION_S,
+    auto_calibrate_limit: bool = False,
+    auto_false_alarm_episode_limit_candidates: Sequence[float] | None = None,
+    auto_event_recall_retention: float = 0.95,
 ) -> tuple[dict[str, float | bool], pd.DataFrame]:
     if thresholds is None:
         thresholds = np.linspace(0.05, 0.95, 19, dtype=np.float32)
@@ -1104,30 +1398,51 @@ def select_best_threshold(
             positive_probs,
             positive_class_encoded=positive_class_encoded,
             chunk_step_s=chunk_step_s,
+            audio_prediction_records=audio_prediction_records,
+            threshold=float(threshold),
+            chunk_length_s=chunk_length_s,
+            min_event_hit_duration_s=min_event_hit_duration_s,
         )
         threshold_rows.append({"threshold": float(threshold), **metrics})
 
     threshold_df = pd.DataFrame(threshold_rows)
-    allowed = threshold_df[
-        threshold_df["false_alarms_per_min"] <= target_false_alarms_per_min
-    ]
+    effective_episode_limit = float(target_false_alarm_episodes_per_min)
+    threshold_calibration_info = {
+        "requested_limit": float(target_false_alarm_episodes_per_min),
+        "selected_limit": float(target_false_alarm_episodes_per_min),
+        "event_recall_retention": float(auto_event_recall_retention),
+        "max_event_recall": float(threshold_df["event_recall"].max()) if not threshold_df.empty else 0.0,
+        "min_required_event_recall": float(
+            (threshold_df["event_recall"].max() if not threshold_df.empty else 0.0)
+            * max(0.0, min(1.0, float(auto_event_recall_retention)))
+        ),
+        "selection_reason": "fixed_limit",
+        "candidate_summaries": [],
+    }
 
-    if not allowed.empty:
-        best_row = allowed.sort_values(
-            by=["f2", "recall", "precision", "threshold"],
-            ascending=[False, False, False, False],
-        ).iloc[0]
-        constraint_satisfied = True
-    else:
-        best_row = threshold_df.sort_values(
-            by=["false_alarms_per_min", "f2", "recall", "precision"],
-            ascending=[True, False, False, False],
-        ).iloc[0]
-        constraint_satisfied = False
+    if auto_calibrate_limit:
+        effective_episode_limit, threshold_calibration_info = (
+            auto_calibrate_false_alarm_episode_limit(
+                threshold_df,
+                requested_limit=target_false_alarm_episodes_per_min,
+                candidate_limits=auto_false_alarm_episode_limit_candidates or [],
+                event_recall_retention=auto_event_recall_retention,
+            )
+        )
+
+    best_row, constraint_satisfied = select_best_threshold_row_from_table(
+        threshold_df,
+        effective_episode_limit,
+    )
 
     threshold_info = dict(best_row.to_dict())
     threshold_info["constraint_satisfied"] = constraint_satisfied
     threshold_info["target_false_alarms_per_min"] = float(target_false_alarms_per_min)
+    threshold_info["target_false_alarm_episodes_per_min"] = float(
+        target_false_alarm_episodes_per_min
+    )
+    threshold_info["selected_false_alarm_episode_limit"] = float(effective_episode_limit)
+    threshold_info["threshold_calibration_info"] = threshold_calibration_info
     return threshold_info, threshold_df
 
 

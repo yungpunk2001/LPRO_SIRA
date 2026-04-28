@@ -2,6 +2,7 @@ import inspect
 import hashlib
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -157,6 +158,24 @@ KNN_NEIGHBORS = int(get_config_value("KNN_NEIGHBORS", 5))
 TARGET_FALSE_ALARMS_PER_MIN = float(
     get_config_value("TARGET_FALSE_ALARMS_PER_MIN", 1.0)
 )
+TARGET_FALSE_ALARM_EPISODES_PER_MIN = float(
+    get_config_value(
+        "TARGET_FALSE_ALARM_EPISODES_PER_MIN",
+        TARGET_FALSE_ALARMS_PER_MIN,
+    )
+)
+MIN_EVENT_HIT_DURATION_S = float(get_config_value("MIN_EVENT_HIT_DURATION_S", 1.0))
+AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT = bool(
+    get_config_value("AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT", False)
+)
+AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES = [
+    float(limit)
+    for limit in get_config_value(
+        "AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES",
+        [0.5, 1.0, 2.0, 3.0, 5.0, 10.0],
+    )
+]
+AUTO_EVENT_RECALL_RETENTION = float(get_config_value("AUTO_EVENT_RECALL_RETENTION", 0.95))
 THRESHOLD_GRID = np.array(
     get_config_value("THRESHOLD_GRID", np.linspace(0.10, 0.95, 18).tolist()),
     dtype=np.float32,
@@ -260,7 +279,12 @@ TRAIN_BACKGROUND_REDUCED_BUCKETS = tuple(
 )
 SAVE_EXPERIMENT_REPORT = bool(get_config_value("SAVE_EXPERIMENT_REPORT", True))
 SAVE_POSTPROCESSING_CONFIG = bool(get_config_value("SAVE_POSTPROCESSING_CONFIG", True))
+SAVE_MODEL_COMPARISON_PLOT = bool(get_config_value("SAVE_MODEL_COMPARISON_PLOT", True))
+SHOW_MODEL_COMPARISON_PLOT = bool(get_config_value("SHOW_MODEL_COMPARISON_PLOT", False))
+SAVE_WINNER_THRESHOLD_PLOT = bool(get_config_value("SAVE_WINNER_THRESHOLD_PLOT", True))
+SHOW_WINNER_THRESHOLD_PLOT = bool(get_config_value("SHOW_WINNER_THRESHOLD_PLOT", False))
 SHOW_RF_PLOT = bool(get_config_value("SHOW_RF_PLOT", True))
+SAVE_RF_PLOT = bool(get_config_value("SAVE_RF_PLOT", True))
 if not 0.0 <= AUGMENTATION_APPLY_PROB <= 1.0:
     raise ValueError("AUGMENTATION_APPLY_PROB debe estar entre 0 y 1.")
 if AUGMENTATION_EXTRA_COPIES < 0:
@@ -289,8 +313,47 @@ EFFECTIVE_EQ_APPLY_PROB = compute_effective_eq_apply_probability(
     EQ_AUGMENTATION_PROB,
 )
 
-SELECTION_METRIC = "validation_f2_with_false_alarm_constraint"
-THRESHOLD_SELECTION_METRIC = "f2_under_false_alarms_per_min"
+SELECTION_METRIC = (
+    "validation_event_recall_with_false_alarm_episode_constraint_then_macro_event_coverage"
+)
+THRESHOLD_SELECTION_METRIC = (
+    "event_recall_with_auto_calibrated_false_alarm_episode_limit_then_macro_event_coverage"
+)
+FINAL_THRESHOLD_CALIBRATION_STAGE = (
+    "validation_before_train_val_refit_frozen_for_final_model"
+)
+
+
+def get_positive_int_env_var(name: str) -> int | None:
+    """Lee un entero positivo desde el entorno o devuelve None."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return None
+
+    raw_value = str(raw_value).strip()
+    if not raw_value:
+        return None
+
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        return None
+
+    return parsed_value if parsed_value > 0 else None
+
+
+SYSTEM_LOGICAL_CPU_COUNT = max(1, os.cpu_count() or 1)
+SLURM_CPUS_PER_TASK = get_positive_int_env_var("SLURM_CPUS_PER_TASK")
+LOGICAL_CPU_COUNT = (
+    max(1, min(SYSTEM_LOGICAL_CPU_COUNT, SLURM_CPUS_PER_TASK))
+    if SLURM_CPUS_PER_TASK is not None
+    else SYSTEM_LOGICAL_CPU_COUNT
+)
+SLURM_JOB_ID = os.environ.get("SLURM_JOB_ID")
+SLURM_JOB_NODELIST = os.environ.get("SLURM_JOB_NODELIST") or os.environ.get(
+    "SLURMD_NODENAME"
+)
+SKLEARN_N_JOBS = max(1, int(get_config_value("SKLEARN_N_JOBS", LOGICAL_CPU_COUNT)))
 
 RUN_NAME_PREFIX = str(get_config_value("RUN_NAME_PREFIX", "clasif_trad_run"))
 RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -300,6 +363,12 @@ RUN_OUTPUT_DIR = Path(
 )
 EXPERIMENT_REPORT_PATH = RUN_OUTPUT_DIR / f"{RUN_BASENAME}_reporte.json"
 POSTPROCESSING_PATH = RUN_OUTPUT_DIR / f"{RUN_BASENAME}_postprocesado.json"
+PLOTS_ROOT_DIR = RUN_OUTPUT_DIR / RUN_BASENAME
+PLOT_STAGE_DIRS = {
+    "train": PLOTS_ROOT_DIR / f"train_{RUN_BASENAME}",
+    "validation": PLOTS_ROOT_DIR / f"validation_{RUN_BASENAME}",
+    "test": PLOTS_ROOT_DIR / f"test_{RUN_BASENAME}",
+}
 SPLIT_MANIFEST_PATH = DATASET_DIR / "metadata" / f"{SPLIT_MANIFEST_BASENAME}.csv"
 SPLIT_MANIFEST_INFO_PATH = (
     DATASET_DIR / "metadata" / f"{SPLIT_MANIFEST_BASENAME}_info.json"
@@ -316,12 +385,43 @@ def validate_required_paths() -> None:
         raise FileNotFoundError(f"No se encontro la carpeta dataset en {DATASET_DIR}.")
 
 
+def print_runtime_cpu_configuration() -> None:
+    """Resume los recursos CPU visibles para este proceso."""
+    thread_env_snapshot = {
+        env_name: env_value
+        for env_name, env_value in (
+            ("OMP_NUM_THREADS", os.environ.get("OMP_NUM_THREADS")),
+            ("OPENBLAS_NUM_THREADS", os.environ.get("OPENBLAS_NUM_THREADS")),
+            ("MKL_NUM_THREADS", os.environ.get("MKL_NUM_THREADS")),
+            ("NUMEXPR_NUM_THREADS", os.environ.get("NUMEXPR_NUM_THREADS")),
+        )
+        if env_value
+    }
+    print(
+        "Contexto SLURM/CPU -> job_id: {job_id} | nodo: {node} | "
+        "cpus_per_task: {cpus} | hilos sistema: {system_logical} | "
+        "hilos efectivos: {logical} | sklearn_n_jobs: {n_jobs}".format(
+            job_id=SLURM_JOB_ID or "local",
+            node=SLURM_JOB_NODELIST or "local",
+            cpus=SLURM_CPUS_PER_TASK or "sin_limite_explicito",
+            system_logical=SYSTEM_LOGICAL_CPU_COUNT,
+            logical=LOGICAL_CPU_COUNT,
+            n_jobs=SKLEARN_N_JOBS,
+        )
+    )
+    if thread_env_snapshot:
+        print(
+            "Limites de hilos del entorno: "
+            f"{json.dumps(thread_env_snapshot, ensure_ascii=True)}"
+        )
+
+
 def candidate_models() -> dict[str, object]:
     return {
         "Random Forest": RandomForestClassifier(
             n_estimators=RF_N_ESTIMATORS,
             random_state=RANDOM_SEED,
-            n_jobs=-1,
+            n_jobs=SKLEARN_N_JOBS,
         ),
         "SVM": SVC(
             kernel="rbf",
@@ -333,7 +433,7 @@ def candidate_models() -> dict[str, object]:
         "KNN": KNeighborsClassifier(
             n_neighbors=KNN_NEIGHBORS,
             weights="distance",
-            n_jobs=-1,
+            n_jobs=SKLEARN_N_JOBS,
         ),
     }
 
@@ -343,10 +443,17 @@ def print_metrics_block(title: str, metrics: dict) -> None:
     print(
         "Precision: {precision:.4f} | Recall: {recall:.4f} | "
         "F1: {f1:.4f} | F2: {f2:.4f} | AUC-PR: {auc_pr:.4f} | "
-        "Accuracy: {accuracy:.4f} | Falsas alarmas/min: {false_alarms_per_min:.2f}".format(
+        "Accuracy: {accuracy:.4f} | Falsas alarmas chunk/min: {false_alarms_per_min:.2f}".format(
             **metrics
         )
     )
+    if "event_recall" in metrics:
+        print(
+            "Event recall: {event_recall:.4f} | Macro event coverage: {macro_event_coverage:.4f} | "
+            "False alarm episodes/min: {false_alarm_episodes_per_min:.2f} | "
+            "Eventos detectados: {detected_positive_event_count}/{total_positive_event_count} | "
+            "Episodios falsos: {false_alarm_episode_count}".format(**metrics)
+        )
     print(
         "Matriz de confusion [[TN, FP], [FN, TP]] = "
         f"{metrics['confusion_matrix']}"
@@ -359,7 +466,13 @@ def build_metrics_report_block(title: str, metrics: dict) -> str:
         (
             "Precision: {precision:.4f} | Recall: {recall:.4f} | "
             "F1: {f1:.4f} | F2: {f2:.4f} | AUC-PR: {auc_pr:.4f} | "
-            "Accuracy: {accuracy:.4f} | Falsas alarmas/min: {false_alarms_per_min:.2f}"
+            "Accuracy: {accuracy:.4f} | Falsas alarmas chunk/min: {false_alarms_per_min:.2f}"
+        ).format(**metrics),
+        (
+            "Event recall: {event_recall:.4f} | Macro event coverage: {macro_event_coverage:.4f} | "
+            "False alarm episodes/min: {false_alarm_episodes_per_min:.2f} | "
+            "Eventos detectados: {detected_positive_event_count}/{total_positive_event_count} | "
+            "Episodios falsos: {false_alarm_episode_count}"
         ).format(**metrics),
         "Matriz de confusion [[TN, FP], [FN, TP]]:",
         str(np.array(metrics["confusion_matrix"])),
@@ -437,20 +550,23 @@ def build_model_selection_key(result: dict) -> tuple:
     if constraint_satisfied:
         return (
             1,
+            float(metrics["event_recall"]),
+            float(metrics["macro_event_coverage"]),
             float(metrics["f2"]),
             float(metrics["recall"]),
-            float(metrics["precision"]),
             float(metrics["auc_pr"]),
-            -float(metrics["false_alarms_per_min"]),
+            -float(metrics["false_alarm_episodes_per_min"]),
         )
 
     return (
         0,
-        -float(metrics["false_alarms_per_min"]),
+        float(metrics["event_recall"]),
+        -float(metrics["false_alarm_episodes_per_min"]),
+        float(metrics["macro_event_coverage"]),
         float(metrics["f2"]),
         float(metrics["recall"]),
-        float(metrics["precision"]),
         float(metrics["auc_pr"]),
+        -float(metrics["false_alarms_per_min"]),
     )
 
 
@@ -792,9 +908,12 @@ def build_split_manifest(
     )
 
     split_labels = pd.Series("unassigned", index=df_master.index, dtype="object")
-    split_labels.iloc[train_idx] = "train"
-    split_labels.iloc[temp_df.iloc[validation_idx].index] = "validation"
-    split_labels.iloc[temp_df.iloc[test_idx].index] = "test"
+    # grouped_stratified_split devuelve etiquetas de indice del DataFrame recibido,
+    # no posiciones relativas. Aqui hay que asignar por .loc para no desalinear el
+    # segundo split (validation/test) cuando temp_df conserva indices originales.
+    split_labels.loc[train_idx] = "train"
+    split_labels.loc[validation_idx] = "validation"
+    split_labels.loc[test_idx] = "test"
 
     manifest_df = df_master.loc[
         :,
@@ -928,6 +1047,7 @@ def evaluate_candidates(
     y_train: np.ndarray,
     x_val_scaled: np.ndarray,
     y_val: np.ndarray,
+    val_audio_records: list[dict],
     positive_class_encoded: int,
     class_weights: dict[int, float] | None,
 ) -> tuple[str, dict[str, dict], dict[str, object]]:
@@ -957,9 +1077,16 @@ def evaluate_candidates(
             y_val,
             val_positive_probs,
             positive_class_encoded=positive_class_encoded,
+            audio_prediction_records=val_audio_records,
             thresholds=THRESHOLD_GRID,
             target_false_alarms_per_min=TARGET_FALSE_ALARMS_PER_MIN,
+            target_false_alarm_episodes_per_min=TARGET_FALSE_ALARM_EPISODES_PER_MIN,
             chunk_step_s=CHUNK_STEP_S,
+            chunk_length_s=CHUNK_LENGTH_S,
+            min_event_hit_duration_s=MIN_EVENT_HIT_DURATION_S,
+            auto_calibrate_limit=AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT,
+            auto_false_alarm_episode_limit_candidates=AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES,
+            auto_event_recall_retention=AUTO_EVENT_RECALL_RETENTION,
         )
         val_pred_binary = (
             val_positive_probs >= float(threshold_info["threshold"])
@@ -970,6 +1097,10 @@ def evaluate_candidates(
             val_positive_probs,
             positive_class_encoded=positive_class_encoded,
             chunk_step_s=CHUNK_STEP_S,
+            audio_prediction_records=val_audio_records,
+            threshold=float(threshold_info["threshold"]),
+            chunk_length_s=CHUNK_LENGTH_S,
+            min_event_hit_duration_s=MIN_EVENT_HIT_DURATION_S,
         )
 
         fitted_models[model_name] = model
@@ -984,7 +1115,10 @@ def evaluate_candidates(
         print_metrics_block(f"Validacion de {model_name}", validation_metrics)
         print(
             f"Umbral seleccionado: {threshold_info['threshold']:.2f} | "
-            f"Restriccion de falsas alarmas cumplida: {threshold_info['constraint_satisfied']}"
+            "Restriccion de episodios falsos cumplida: "
+            f"{threshold_info['constraint_satisfied']} | "
+            "limite seleccionado="
+            f"{threshold_info['selected_false_alarm_episode_limit']:.2f}"
         )
         if sample_weight is not None and not used_sample_weight:
             print(
@@ -1002,7 +1136,10 @@ def train_all_final_models(
     y_val: np.ndarray,
     x_test: np.ndarray,
     y_test: np.ndarray,
+    val_audio_records: list[dict],
+    test_audio_records: list[dict],
     positive_class_encoded: int,
+    selection_results: dict[str, dict],
     class_weights: dict[int, float] | None,
 ) -> tuple[dict[str, object], StandardScaler, dict[str, dict]]:
     x_train_val = np.vstack([x_train, x_val])
@@ -1031,17 +1168,21 @@ def train_all_final_models(
             final_model.classes_,
             positive_class_encoded,
         )
-        val_positive_probs = final_model.predict_proba(x_val_scaled)[:, probability_index]
-        recalibrated_threshold_info, recalibrated_threshold_table = select_best_threshold(
-            y_val,
-            val_positive_probs,
-            positive_class_encoded=positive_class_encoded,
-            thresholds=THRESHOLD_GRID,
-            target_false_alarms_per_min=TARGET_FALSE_ALARMS_PER_MIN,
-            chunk_step_s=CHUNK_STEP_S,
+        selection_result = selection_results[model_name]
+        final_threshold_info = dict(selection_result["threshold_info"])
+        final_threshold_info["threshold_frozen_after_selection"] = True
+        final_threshold_info["threshold_source_split"] = "validation_clean_pre_refit"
+        final_threshold_info["threshold_calibration_stage"] = (
+            FINAL_THRESHOLD_CALIBRATION_STAGE
         )
+        final_threshold_table = [
+            dict(row) for row in selection_result["threshold_table"]
+        ]
+
+        val_positive_probs = final_model.predict_proba(x_val_scaled)[:, probability_index]
+        threshold = float(final_threshold_info["threshold"])
         val_pred_binary = (
-            val_positive_probs >= float(recalibrated_threshold_info["threshold"])
+            val_positive_probs >= threshold
         ).astype(np.int32)
         validation_metrics_refit = compute_detection_metrics(
             y_val,
@@ -1049,10 +1190,13 @@ def train_all_final_models(
             val_positive_probs,
             positive_class_encoded=positive_class_encoded,
             chunk_step_s=CHUNK_STEP_S,
+            audio_prediction_records=val_audio_records,
+            threshold=threshold,
+            chunk_length_s=CHUNK_LENGTH_S,
+            min_event_hit_duration_s=MIN_EVENT_HIT_DURATION_S,
         )
 
         test_positive_probs = final_model.predict_proba(x_test_scaled)[:, probability_index]
-        threshold = float(recalibrated_threshold_info["threshold"])
         test_pred_binary = (test_positive_probs >= threshold).astype(np.int32)
         test_metrics = compute_detection_metrics(
             y_test,
@@ -1060,15 +1204,18 @@ def train_all_final_models(
             test_positive_probs,
             positive_class_encoded=positive_class_encoded,
             chunk_step_s=CHUNK_STEP_S,
+            audio_prediction_records=test_audio_records,
+            threshold=threshold,
+            chunk_length_s=CHUNK_LENGTH_S,
+            min_event_hit_duration_s=MIN_EVENT_HIT_DURATION_S,
         )
 
         final_models[model_name] = final_model
         final_results[model_name] = {
             "validation_metrics_refit": validation_metrics_refit,
-            "recalibrated_threshold_info": recalibrated_threshold_info,
-            "recalibrated_threshold_table": recalibrated_threshold_table.to_dict(
-                orient="records"
-            ),
+            "validation_metrics_refit_is_seen_data": True,
+            "final_threshold_info": final_threshold_info,
+            "final_threshold_table": final_threshold_table,
             "test_metrics": test_metrics,
             "test_accuracy": float(test_metrics["accuracy"]),
             "threshold": threshold,
@@ -1078,7 +1225,135 @@ def train_all_final_models(
     return final_models, scaler, final_results
 
 
-def plot_rf_feature_importance(fitted_rf_model: RandomForestClassifier) -> None:
+def prepare_plot_output_dirs() -> None:
+    """Recrea la jerarquia de plots por etapa para esta ejecucion."""
+    if PLOTS_ROOT_DIR.exists():
+        shutil.rmtree(PLOTS_ROOT_DIR)
+    PLOTS_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+    for stage_dir in PLOT_STAGE_DIRS.values():
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+
+def save_bar_metric_plot(
+    labels: list[str],
+    values: np.ndarray,
+    title: str,
+    ylabel: str,
+    save_path: Path,
+    colors: list[str],
+    show: bool = False,
+    target_line: float | None = None,
+    target_label: str | None = None,
+    footer_note: str | None = None,
+) -> None:
+    fig, axis = plt.subplots(figsize=(max(9.0, len(labels) * 1.8), 5.5))
+    bars = axis.bar(labels, values, color=colors, edgecolor="black")
+    axis.set_title(title)
+    axis.set_ylabel(ylabel)
+    axis.tick_params(axis="x", rotation=18)
+    axis.grid(axis="y", alpha=0.25)
+
+    upper_margin = max(0.03, float(np.max(np.abs(values))) * 0.08)
+    if target_line is not None:
+        axis.axhline(
+            target_line,
+            color="#2ca02c",
+            linestyle=":",
+            linewidth=1.5,
+            label=target_label or f"Objetivo ({target_line:.2f})",
+        )
+        axis.legend()
+    uses_rate_scale = ylabel in {"False alarms/min", "False alarm episodes/min"}
+    if not uses_rate_scale:
+        axis.set_ylim(0.0, min(1.05, float(np.max(values)) + upper_margin))
+
+    for bar, value in zip(bars, values):
+        axis.text(
+            bar.get_x() + (bar.get_width() / 2.0),
+            bar.get_height() + upper_margin * 0.15,
+            f"{value:.3f}" if not uses_rate_scale else f"{value:.2f}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    if footer_note:
+        fig.text(0.01, 0.01, footer_note, fontsize=9)
+        fig.tight_layout(rect=(0, 0.04, 1, 0.98))
+    else:
+        fig.tight_layout()
+
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Grafica guardada en: {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def save_line_metric_plot(
+    x_values,
+    y_values,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    save_path: Path,
+    show: bool = False,
+    color: str = "#1f77b4",
+    selected_x: float | None = None,
+    selected_label: str | None = None,
+    target_y: float | None = None,
+    target_label: str | None = None,
+) -> None:
+    fig, axis = plt.subplots(figsize=(10, 5))
+    axis.plot(
+        x_values,
+        y_values,
+        marker="o",
+        linewidth=2.0,
+        color=color,
+        label=ylabel,
+    )
+    axis.set_title(title)
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel(ylabel)
+    axis.grid(alpha=0.25)
+
+    if selected_x is not None:
+        axis.axvline(
+            selected_x,
+            color="#d62728",
+            linestyle="--",
+            linewidth=1.5,
+            label=selected_label or f"Referencia ({selected_x:.2f})",
+        )
+    if target_y is not None:
+        axis.axhline(
+            target_y,
+            color="#2ca02c",
+            linestyle=":",
+            linewidth=1.5,
+            label=target_label or f"Objetivo ({target_y:.2f})",
+        )
+    if selected_x is not None or target_y is not None:
+        axis.legend()
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Grafica guardada en: {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_rf_feature_importance(
+    fitted_rf_model: RandomForestClassifier,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> None:
     importances = fitted_rf_model.feature_importances_
     df_importances = pd.DataFrame(
         {
@@ -1088,18 +1363,240 @@ def plot_rf_feature_importance(fitted_rf_model: RandomForestClassifier) -> None:
     ).sort_values(by="Importancia", ascending=False)
 
     top_10 = df_importances.head(10)
-    plt.figure(figsize=(10, 6))
-    plt.barh(
+    fig, axis = plt.subplots(figsize=(10, 6))
+    axis.barh(
         top_10["Caracteristica"][::-1],
         top_10["Importancia"][::-1],
         color="skyblue",
         edgecolor="black",
     )
-    plt.title("Top 10 features del Random Forest")
-    plt.xlabel("Importancia")
-    plt.ylabel("Feature")
-    plt.tight_layout()
-    plt.show()
+    axis.set_title("Top 10 features del Random Forest")
+    axis.set_xlabel("Importancia")
+    axis.set_ylabel("Feature")
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Grafica de importancia RF guardada en: {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_validation_model_comparison(
+    selection_results: dict[str, dict],
+    winner_name: str,
+    output_dir: Path,
+    show: bool = False,
+) -> dict[str, str]:
+    ordered_results = sorted(
+        selection_results.items(),
+        key=lambda item: build_model_selection_key(item[1]),
+        reverse=True,
+    )
+
+    rows = []
+    for model_name, result in ordered_results:
+        metrics = result["validation_metrics"]
+        rows.append(
+            {
+                "model_name": model_name,
+                "display_name": (
+                    model_name
+                    if bool(result["threshold_info"]["constraint_satisfied"])
+                    else f"{model_name} *"
+                ),
+                "event_recall": float(metrics["event_recall"]),
+                "macro_event_coverage": float(metrics["macro_event_coverage"]),
+                "f2": float(metrics["f2"]),
+                "recall": float(metrics["recall"]),
+                "auc_pr": float(metrics["auc_pr"]),
+                "false_alarm_episodes_per_min": float(metrics["false_alarm_episodes_per_min"]),
+                "false_alarms_per_min": float(metrics["false_alarms_per_min"]),
+                "constraint_satisfied": bool(result["threshold_info"]["constraint_satisfied"]),
+            }
+        )
+
+    comparison_df = pd.DataFrame(rows)
+    labels = comparison_df["display_name"].tolist()
+    colors = [
+        "#d62728" if name == winner_name else "#4e79a7"
+        for name in comparison_df["model_name"]
+    ]
+    footer_note = None
+    if not bool(comparison_df["constraint_satisfied"].all()):
+        footer_note = (
+            "* El umbral seleccionado para ese modelo no cumple la restriccion de episodios falsos."
+        )
+
+    saved_paths: dict[str, str] = {}
+    metric_specs = [
+        ("event_recall", "Event recall", None),
+        ("macro_event_coverage", "Macro event coverage", None),
+        ("f2", "F2", None),
+        ("recall", "Recall", None),
+        ("auc_pr", "AUC-PR", None),
+        ("false_alarm_episodes_per_min", "False alarm episodes/min", None),
+        ("false_alarms_per_min", "False alarms/min", None),
+    ]
+    for metric_key, metric_title, target_line in metric_specs:
+        save_path = output_dir / f"model_comparison_{metric_key}.png"
+        save_bar_metric_plot(
+            labels,
+            comparison_df[metric_key].to_numpy(dtype=float),
+            title=f"Validacion limpia | {metric_title} por modelo | Ganador: {winner_name}",
+            ylabel=metric_title,
+            save_path=save_path,
+            colors=colors,
+            show=show,
+            target_line=target_line,
+            target_label=(
+                f"Objetivo ({target_line:.2f})"
+                if target_line is not None
+                else None
+            ),
+            footer_note=footer_note,
+        )
+        saved_paths[metric_key] = str(save_path)
+    return saved_paths
+
+
+def plot_test_model_comparison(
+    final_results: dict[str, dict],
+    winner_name: str,
+    output_dir: Path,
+    show: bool = False,
+) -> dict[str, str]:
+    rows = []
+    for model_name, result in final_results.items():
+        metrics = result["test_metrics"]
+        rows.append(
+            {
+                "model_name": model_name,
+                "display_name": model_name,
+                "event_recall": float(metrics["event_recall"]),
+                "macro_event_coverage": float(metrics["macro_event_coverage"]),
+                "f2": float(metrics["f2"]),
+                "recall": float(metrics["recall"]),
+                "auc_pr": float(metrics["auc_pr"]),
+                "false_alarm_episodes_per_min": float(metrics["false_alarm_episodes_per_min"]),
+                "false_alarms_per_min": float(metrics["false_alarms_per_min"]),
+            }
+        )
+
+    comparison_df = pd.DataFrame(rows).sort_values(
+        by=[
+            "event_recall",
+            "false_alarm_episodes_per_min",
+            "macro_event_coverage",
+            "f2",
+            "auc_pr",
+            "false_alarms_per_min",
+        ],
+        ascending=[False, True, False, False, False, True],
+    )
+    labels = comparison_df["display_name"].tolist()
+    colors = [
+        "#d62728" if name == winner_name else "#4e79a7"
+        for name in comparison_df["model_name"]
+    ]
+
+    saved_paths: dict[str, str] = {}
+    metric_specs = [
+        ("event_recall", "Event recall", None),
+        ("macro_event_coverage", "Macro event coverage", None),
+        ("f2", "F2", None),
+        ("recall", "Recall", None),
+        ("auc_pr", "AUC-PR", None),
+        ("false_alarm_episodes_per_min", "False alarm episodes/min", None),
+        ("false_alarms_per_min", "False alarms/min", None),
+    ]
+    for metric_key, metric_title, target_line in metric_specs:
+        save_path = output_dir / f"model_comparison_{metric_key}.png"
+        save_bar_metric_plot(
+            labels,
+            comparison_df[metric_key].to_numpy(dtype=float),
+            title=f"Test | {metric_title} por modelo | Ganador: {winner_name}",
+            ylabel=metric_title,
+            save_path=save_path,
+            colors=colors,
+            show=show,
+            target_line=target_line,
+            target_label=(
+                f"Objetivo ({target_line:.2f})"
+                if target_line is not None
+                else None
+            ),
+        )
+        saved_paths[metric_key] = str(save_path)
+    return saved_paths
+
+
+def plot_threshold_analysis(
+    threshold_rows: list[dict],
+    model_name: str,
+    threshold_info: dict,
+    stage_label: str,
+    output_dir: Path,
+    filename_prefix: str = "winner_threshold",
+    show: bool = False,
+) -> dict[str, str]:
+    threshold_df = pd.DataFrame(threshold_rows)
+    if threshold_df.empty:
+        return {}
+
+    selected_threshold = float(threshold_info["threshold"])
+    constraint_satisfied = bool(threshold_info["constraint_satisfied"])
+    target_false_alarm_episodes_per_min = float(
+        threshold_info.get(
+            "selected_false_alarm_episode_limit",
+            threshold_info.get("target_false_alarm_episodes_per_min", 0.0),
+        )
+    )
+    saved_paths: dict[str, str] = {}
+
+    metric_specs = [
+        ("event_recall", "Event recall", "#4e79a7", None, None),
+        ("macro_event_coverage", "Macro event coverage", "#59a14f", None, None),
+        ("f2", "F2", "#1f77b4", None, None),
+        (
+            "false_alarm_episodes_per_min",
+            "False alarm episodes/min",
+            "#9c755f",
+            target_false_alarm_episodes_per_min,
+            f"Objetivo ({target_false_alarm_episodes_per_min:.2f})",
+        ),
+        (
+            "false_alarms_per_min",
+            "False alarms/min",
+            "#ff7f0e",
+            None,
+            None,
+        ),
+    ]
+    for metric_key, metric_title, color, target_y, target_label in metric_specs:
+        save_path = output_dir / f"{filename_prefix}_{metric_key}.png"
+        save_line_metric_plot(
+            threshold_df["threshold"],
+            threshold_df[metric_key],
+            title=(
+                f"{stage_label} | {model_name} | {metric_title} frente al umbral | "
+                f"restriccion cumplida: {constraint_satisfied}"
+            ),
+            xlabel="Umbral",
+            ylabel=metric_title,
+            save_path=save_path,
+            show=show,
+            color=color,
+            selected_x=selected_threshold,
+            selected_label=f"Umbral aplicado ({selected_threshold:.2f})",
+            target_y=target_y,
+            target_label=target_label,
+        )
+        saved_paths[metric_key] = str(save_path)
+    return saved_paths
 
 
 def save_experiment_outputs(report_payload: dict, winner_postprocessing: dict) -> None:
@@ -1119,7 +1616,9 @@ def save_experiment_outputs(report_payload: dict, winner_postprocessing: dict) -
 def main() -> None:
     validate_required_paths()
     RUN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    prepare_plot_output_dirs()
 
+    print_runtime_cpu_configuration()
     print(f"Cargando metadata desde: {METADATA_PATH}")
     if RUNTIME_CONFIG_PATH is not None:
         print(f"Overrides de configuracion cargados desde: {RUNTIME_CONFIG_PATH}")
@@ -1312,20 +1811,22 @@ def main() -> None:
         eq_shelf_sharpness_range=EQ_SHELF_SHARPNESS_RANGE,
     )
     print("Procesando validation set...")
-    x_val, y_val = build_dataset_in_memory(
+    x_val, y_val, val_audio_records = build_dataset_in_memory(
         val_df,
         base_path=DATASET_DIR,
         sr=SAMPLE_RATE,
         chunk_length_s=CHUNK_LENGTH_S,
         overlap_s=OVERLAP_S,
+        return_audio_records=True,
     )
     print("Procesando test set...")
-    x_test, y_test = build_dataset_in_memory(
+    x_test, y_test, test_audio_records = build_dataset_in_memory(
         test_df,
         base_path=DATASET_DIR,
         sr=SAMPLE_RATE,
         chunk_length_s=CHUNK_LENGTH_S,
         overlap_s=OVERLAP_S,
+        return_audio_records=True,
     )
 
     if min(len(x_train), len(x_val), len(x_test)) == 0:
@@ -1357,6 +1858,7 @@ def main() -> None:
         y_train,
         x_val_scaled,
         y_val,
+        val_audio_records,
         positive_class_encoded=positive_class_encoded,
         class_weights=exact_train_class_weights,
     )
@@ -1372,6 +1874,10 @@ def main() -> None:
     print(
         f"Umbral recomendado para '{positive_label}': "
         f"{winner_selection_threshold_info['threshold']:.2f}"
+    )
+    print(
+        "Limite de episodios falsos/min usado en seleccion: "
+        f"{winner_selection_threshold_info['selected_false_alarm_episode_limit']:.2f}"
     )
 
     x_train_val = np.vstack([x_train, x_val])
@@ -1396,7 +1902,10 @@ def main() -> None:
         y_val,
         x_test,
         y_test,
+        val_audio_records,
+        test_audio_records,
         positive_class_encoded=positive_class_encoded,
+        selection_results=results,
         class_weights=exact_train_val_class_weights,
     )
 
@@ -1405,11 +1914,18 @@ def main() -> None:
     print("=" * 56)
     for model_name, model_result in final_results.items():
         print_metrics_block(
-            f"Validacion recalibrada de {model_name}",
+            f"Validacion diagnostica tras refit (datos vistos) de {model_name}",
             model_result["validation_metrics_refit"],
         )
         print(
-            f"Umbral recalibrado para {model_name}: {model_result['threshold']:.2f}"
+            f"Umbral final congelado para {model_name}: {model_result['threshold']:.2f}"
+        )
+        print(
+            "Origen del umbral final: validacion limpia previa al refit train+val."
+        )
+        print(
+            "Limite de episodios falsos/min usado para fijarlo: "
+            f"{model_result['final_threshold_info']['selected_false_alarm_episode_limit']:.2f}"
         )
         print_metrics_block(
             f"Test de {model_name}",
@@ -1418,7 +1934,7 @@ def main() -> None:
         print(f"Umbral usado en test: {model_result['threshold']:.2f}\n")
 
     final_model = final_models[winner_name]
-    winner_threshold_info = final_results[winner_name]["recalibrated_threshold_info"]
+    winner_threshold_info = final_results[winner_name]["final_threshold_info"]
     winner_test_metrics = final_results[winner_name]["test_metrics"]
 
     model_scores = {}
@@ -1428,10 +1944,11 @@ def main() -> None:
             "validation_threshold": float(results[model_name]["threshold_info"]["threshold"]),
             "validation_threshold_info": results[model_name]["threshold_info"],
             "validation_metrics_refit": final_results[model_name]["validation_metrics_refit"],
-            "final_threshold": float(
-                final_results[model_name]["recalibrated_threshold_info"]["threshold"]
+            "validation_metrics_refit_is_seen_data": bool(
+                final_results[model_name]["validation_metrics_refit_is_seen_data"]
             ),
-            "final_threshold_info": final_results[model_name]["recalibrated_threshold_info"],
+            "final_threshold": float(final_results[model_name]["final_threshold_info"]["threshold"]),
+            "final_threshold_info": final_results[model_name]["final_threshold_info"],
             "test_metrics": final_results[model_name]["test_metrics"],
             "used_sample_weight_in_validation_fit": bool(
                 results[model_name]["used_sample_weight"]
@@ -1441,6 +1958,11 @@ def main() -> None:
             ),
         }
 
+    diagnostic_plot_paths = {
+        "root_dir": str(PLOTS_ROOT_DIR),
+        "stage_dirs": {stage: str(path) for stage, path in PLOT_STAGE_DIRS.items()},
+    }
+
     report_payload = {
         "run_name": RUN_BASENAME,
         "run_output_dir": str(RUN_OUTPUT_DIR),
@@ -1449,6 +1971,13 @@ def main() -> None:
         "selection_metric": SELECTION_METRIC,
         "threshold_selection_metric": THRESHOLD_SELECTION_METRIC,
         "target_false_alarms_per_min": TARGET_FALSE_ALARMS_PER_MIN,
+        "target_false_alarm_episodes_per_min": TARGET_FALSE_ALARM_EPISODES_PER_MIN,
+        "min_event_hit_duration_s": MIN_EVENT_HIT_DURATION_S,
+        "auto_calibrate_false_alarm_episode_limit": AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT,
+        "auto_false_alarm_episode_limit_candidates": list(
+            AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES
+        ),
+        "auto_event_recall_retention": AUTO_EVENT_RECALL_RETENTION,
         "sample_rate": SAMPLE_RATE,
         "chunk_length_s": CHUNK_LENGTH_S,
         "use_overlap": USE_OVERLAP,
@@ -1494,6 +2023,12 @@ def main() -> None:
         "eq_high_shelf_cutoff_hz_range": list(EQ_HIGH_SHELF_CUTOFF_HZ_RANGE),
         "eq_bell_bandwidth_octaves_range": list(EQ_BELL_BANDWIDTH_OCTAVES_RANGE),
         "eq_shelf_sharpness_range": list(EQ_SHELF_SHARPNESS_RANGE),
+        "system_logical_cpu_count": SYSTEM_LOGICAL_CPU_COUNT,
+        "logical_cpu_count": LOGICAL_CPU_COUNT,
+        "slurm_cpus_per_task": SLURM_CPUS_PER_TASK,
+        "slurm_job_id": SLURM_JOB_ID,
+        "slurm_job_nodelist": SLURM_JOB_NODELIST,
+        "sklearn_n_jobs": SKLEARN_N_JOBS,
         "feature_names": feature_names(),
         "positive_label": positive_label,
         "labels": [str(label) for label in label_encoder.classes_],
@@ -1504,8 +2039,15 @@ def main() -> None:
         "class_weights_extracted": exact_train_class_weights or {},
         "class_weights_train_val_extracted": exact_train_val_class_weights or {},
         "per_model": model_scores,
+        "diagnostic_plot_paths": diagnostic_plot_paths,
         "threshold_grid": THRESHOLD_GRID.tolist(),
-        "threshold_calibration_stage": "validation_after_train_val_refit",
+        "threshold_calibration_stage": FINAL_THRESHOLD_CALIBRATION_STAGE,
+        "validation_metrics_refit_is_seen_data": True,
+        "notes": (
+            "El umbral final recomendado se fija con la validacion limpia previa al refit y "
+            "se reutiliza sin recalibrar tras entrenar el modelo final con train+val. "
+            "Las metricas `validation_metrics_refit` son solo diagnosticas sobre datos ya vistos."
+        ),
     }
 
     postprocessing_payload = {
@@ -1514,6 +2056,16 @@ def main() -> None:
         "winner_name": winner_name,
         "recommended_chunk_threshold": float(winner_threshold_info["threshold"]),
         "target_false_alarms_per_min": TARGET_FALSE_ALARMS_PER_MIN,
+        "target_false_alarm_episodes_per_min": TARGET_FALSE_ALARM_EPISODES_PER_MIN,
+        "selected_false_alarm_episode_limit": float(
+            winner_threshold_info["selected_false_alarm_episode_limit"]
+        ),
+        "min_event_hit_duration_s": MIN_EVENT_HIT_DURATION_S,
+        "auto_calibrate_false_alarm_episode_limit": AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT,
+        "auto_false_alarm_episode_limit_candidates": list(
+            AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES
+        ),
+        "auto_event_recall_retention": AUTO_EVENT_RECALL_RETENTION,
         "chunk_length_s": CHUNK_LENGTH_S,
         "use_overlap": USE_OVERLAP,
         "configured_overlap_s": CONFIGURED_OVERLAP_S,
@@ -1548,6 +2100,12 @@ def main() -> None:
         "eq_high_shelf_cutoff_hz_range": list(EQ_HIGH_SHELF_CUTOFF_HZ_RANGE),
         "eq_bell_bandwidth_octaves_range": list(EQ_BELL_BANDWIDTH_OCTAVES_RANGE),
         "eq_shelf_sharpness_range": list(EQ_SHELF_SHARPNESS_RANGE),
+        "system_logical_cpu_count": SYSTEM_LOGICAL_CPU_COUNT,
+        "logical_cpu_count": LOGICAL_CPU_COUNT,
+        "slurm_cpus_per_task": SLURM_CPUS_PER_TASK,
+        "slurm_job_id": SLURM_JOB_ID,
+        "slurm_job_nodelist": SLURM_JOB_NODELIST,
+        "sklearn_n_jobs": SKLEARN_N_JOBS,
         "apply_train_background_subsampling": APPLY_TRAIN_BACKGROUND_SUBSAMPLING,
         "train_background_to_siren_chunk_ratio": TRAIN_BACKGROUND_TO_SIREN_CHUNK_RATIO,
         "train_background_min_groups_per_bucket": TRAIN_BACKGROUND_MIN_GROUPS_PER_BUCKET,
@@ -1571,12 +2129,20 @@ def main() -> None:
         "runtime_config_overrides": RUNTIME_CONFIG_OVERRIDES,
         "validation_metrics": winner_validation_metrics,
         "validation_metrics_refit": final_results[winner_name]["validation_metrics_refit"],
+        "validation_metrics_refit_is_seen_data": True,
         "selection_threshold_info": winner_selection_threshold_info,
         "final_threshold_info": winner_threshold_info,
         "test_metrics": winner_test_metrics,
+        "threshold_calibration_info": winner_threshold_info.get("threshold_calibration_info"),
         "selection_metric": SELECTION_METRIC,
         "threshold_selection_metric": THRESHOLD_SELECTION_METRIC,
-        "threshold_calibration_stage": "validation_after_train_val_refit",
+        "threshold_calibration_stage": FINAL_THRESHOLD_CALIBRATION_STAGE,
+        "diagnostic_plot_paths": diagnostic_plot_paths,
+        "notes": (
+            "El umbral final recomendado se fija con la validacion limpia previa al refit y "
+            "se reutiliza sin recalibrar tras entrenar el modelo final con train+val. "
+            "Las metricas `validation_metrics_refit` son solo diagnosticas sobre datos ya vistos."
+        ),
     }
 
     save_experiment_outputs(report_payload, postprocessing_payload)
@@ -1611,6 +2177,14 @@ def main() -> None:
         "train_selection_summary": train_selection_summary,
         "use_class_weights": USE_CLASS_WEIGHTS,
         "use_data_augmentation": USE_DATA_AUGMENTATION,
+        "target_false_alarms_per_min": TARGET_FALSE_ALARMS_PER_MIN,
+        "target_false_alarm_episodes_per_min": TARGET_FALSE_ALARM_EPISODES_PER_MIN,
+        "min_event_hit_duration_s": MIN_EVENT_HIT_DURATION_S,
+        "auto_calibrate_false_alarm_episode_limit": AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT,
+        "auto_false_alarm_episode_limit_candidates": list(
+            AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES
+        ),
+        "auto_event_recall_retention": AUTO_EVENT_RECALL_RETENTION,
         "use_pitch_shift_augmentation": USE_PITCH_SHIFT_AUGMENTATION,
         "augmentation_apply_prob": AUGMENTATION_APPLY_PROB,
         "augmentation_extra_copies": AUGMENTATION_EXTRA_COPIES,
@@ -1627,6 +2201,12 @@ def main() -> None:
         "eq_high_shelf_cutoff_hz_range": list(EQ_HIGH_SHELF_CUTOFF_HZ_RANGE),
         "eq_bell_bandwidth_octaves_range": list(EQ_BELL_BANDWIDTH_OCTAVES_RANGE),
         "eq_shelf_sharpness_range": list(EQ_SHELF_SHARPNESS_RANGE),
+        "system_logical_cpu_count": SYSTEM_LOGICAL_CPU_COUNT,
+        "logical_cpu_count": LOGICAL_CPU_COUNT,
+        "slurm_cpus_per_task": SLURM_CPUS_PER_TASK,
+        "slurm_job_id": SLURM_JOB_ID,
+        "slurm_job_nodelist": SLURM_JOB_NODELIST,
+        "sklearn_n_jobs": SKLEARN_N_JOBS,
         "train_chunk_counts_metadata": chunk_counts_metadata or {},
         "train_chunk_counts_extracted": exact_train_chunk_counts or {},
         "train_val_chunk_counts_extracted": exact_train_val_chunk_counts or {},
@@ -1635,7 +2215,7 @@ def main() -> None:
         "class_weights_train_val_extracted": exact_train_val_class_weights or {},
         "experiment_report_path": str(EXPERIMENT_REPORT_PATH),
         "postprocessing_path": str(POSTPROCESSING_PATH),
-        "threshold_calibration_stage": "validation_after_train_val_refit",
+        "threshold_calibration_stage": FINAL_THRESHOLD_CALIBRATION_STAGE,
     }
 
     saved_paths = save_training_artifacts(
@@ -1658,6 +2238,61 @@ def main() -> None:
         output_dir=RUN_OUTPUT_DIR,
     )
 
+    generated_plot_paths: dict[str, object] = {}
+    if SAVE_MODEL_COMPARISON_PLOT or SHOW_MODEL_COMPARISON_PLOT:
+        validation_plot_paths = plot_validation_model_comparison(
+            results,
+            winner_name=winner_name,
+            output_dir=PLOT_STAGE_DIRS["validation"],
+            show=SHOW_MODEL_COMPARISON_PLOT,
+        )
+        for metric_name, plot_path in validation_plot_paths.items():
+            generated_plot_paths[f"validation_model_comparison_{metric_name}"] = plot_path
+
+    if SAVE_WINNER_THRESHOLD_PLOT or SHOW_WINNER_THRESHOLD_PLOT:
+        validation_threshold_paths = plot_threshold_analysis(
+            final_results[winner_name]["final_threshold_table"],
+            model_name=winner_name,
+            threshold_info=winner_threshold_info,
+            stage_label="Validacion limpia usada para fijar el umbral final",
+            output_dir=PLOT_STAGE_DIRS["validation"],
+            filename_prefix="winner_frozen_threshold",
+            show=SHOW_WINNER_THRESHOLD_PLOT,
+        )
+        for metric_name, plot_path in validation_threshold_paths.items():
+            generated_plot_paths[f"validation_winner_threshold_{metric_name}"] = plot_path
+
+    if SAVE_MODEL_COMPARISON_PLOT or SHOW_MODEL_COMPARISON_PLOT:
+        test_plot_paths = plot_test_model_comparison(
+            final_results,
+            winner_name=winner_name,
+            output_dir=PLOT_STAGE_DIRS["test"],
+            show=SHOW_MODEL_COMPARISON_PLOT,
+        )
+        for metric_name, plot_path in test_plot_paths.items():
+            generated_plot_paths[f"test_model_comparison_{metric_name}"] = plot_path
+
+    if generated_plot_paths:
+        saved_paths["plots"] = generated_plot_paths
+
+    rf_model = final_models.get("Random Forest")
+    if rf_model is not None and (SAVE_RF_PLOT or SHOW_RF_PLOT):
+        if SHOW_RF_PLOT:
+            print("\nMostrando top 10 de features del Random Forest.")
+        plot_rf_feature_importance(
+            rf_model,
+            save_path=(
+                PLOT_STAGE_DIRS["train"] / "rf_feature_importance.png"
+                if SAVE_RF_PLOT
+                else None
+            ),
+            show=SHOW_RF_PLOT,
+        )
+        if SAVE_RF_PLOT:
+            saved_paths.setdefault("plots", {})["rf_feature_importance"] = str(
+                PLOT_STAGE_DIRS["train"] / "rf_feature_importance.png"
+            )
+
     print("\nArtefactos guardados:")
     for path_name, path_value in saved_paths.items():
         if isinstance(path_value, dict):
@@ -1666,11 +2301,6 @@ def main() -> None:
                 print(f"  - {sub_name}: {Path(sub_path)}")
         else:
             print(f"- {path_name}: {Path(path_value)}")
-
-    rf_model = final_models.get("Random Forest")
-    if rf_model is not None and SHOW_RF_PLOT:
-        print("\nMostrando top 10 de features del Random Forest.")
-        plot_rf_feature_importance(rf_model)
 
 
 if __name__ == "__main__":

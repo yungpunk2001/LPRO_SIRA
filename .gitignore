@@ -13,6 +13,13 @@ DataSet Camilo y Daniela/*
 !DataSet Camilo y Daniela/Clasificadores Tradicionales/piloto_micro_clasif_trad.py
 !DataSet Camilo y Daniela/Clasificadores Tradicionales/barrido_entrenamientos_clasif_trad.py
 !DataSet Camilo y Daniela/Clasificadores Tradicionales/clasif_trad_utils.py
+DataSet Camilo y Daniela/HPC/README.md
+DataSet Camilo y Daniela/HPC/run_barrido_clasif_trad_cpu.sbatch
+DataSet Camilo y Daniela/HPC/run_barrido_margin_3_gpu.sbatch
+DataSet Camilo y Daniela/HPC/train_clasif_trad_cpu.sbatch
+DataSet Camilo y Daniela/HPC/train_clasif_trad_cpu_array.sbatch
+DataSet Camilo y Daniela/HPC/train_margin_3_gpu.sbatch
+DataSet Camilo y Daniela/HPC/train_margin_3_gpu_array.sbatch
 !DataSet Camilo y Daniela/dataset/
 !DataSet Camilo y Daniela/dataset/metadata/
 !DataSet Camilo y Daniela/dataset/metadata/master_index.csv

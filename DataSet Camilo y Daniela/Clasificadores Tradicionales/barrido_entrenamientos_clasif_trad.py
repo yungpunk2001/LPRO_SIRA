@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -19,20 +20,21 @@ LOCAL_VENV_PYTHON = SCRIPT_DIR.parent / ".venv" / "Scripts" / "python.exe"
 # ---------------------------------------------------------------------------
 # Configuracion general del barrido
 # ---------------------------------------------------------------------------
-PYTHON_COMMAND = (
-    [str(LOCAL_VENV_PYTHON)]
-    if LOCAL_VENV_PYTHON.exists()
-    else ["py", "-3"]
-)
+PYTHON_COMMAND = [
+    os.environ.get("PYTHON_BIN")
+    or (str(LOCAL_VENV_PYTHON) if LOCAL_VENV_PYTHON.exists() else sys.executable or "python3")
+]
 CONTINUE_ON_ERROR = True
 STREAM_TRAINING_LOGS = True
 MAX_EXPERIMENTS = None
 
 # El barrido debe decidir con la validacion limpia previa al refit. Las
 # metricas `validation_refit_*` se conservan solo como referencia diagnostica.
-PRIMARY_RANK_METRIC = "validation_f2"
-SECONDARY_RANK_METRIC = "validation_recall"
-TERTIARY_RANK_METRIC = "validation_auc_pr"
+PRIMARY_RANK_METRIC = "validation_event_recall"
+FALSE_ALARM_RANK_METRIC = "validation_false_alarm_episodes_per_min"
+SECONDARY_RANK_METRIC = "validation_macro_event_coverage"
+TERTIARY_RANK_METRIC = "validation_f2"
+QUATERNARY_RANK_METRIC = "validation_auc_pr"
 
 AUTO_ITERATIVE_REFINEMENT = True
 MAX_SWEEP_ROUNDS = 2
@@ -65,6 +67,9 @@ FIXED_OVERRIDES = {
     "SAVE_POSTPROCESSING_CONFIG": True,
     "SHOW_RF_PLOT": False,
     "TARGET_FALSE_ALARMS_PER_MIN": 1.0,
+    "AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT": True,
+    "AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES": [0.5, 1.0, 2.0, 3.0, 5.0, 10.0],
+    "AUTO_EVENT_RECALL_RETENTION": 0.95,
     "CHUNK_LENGTH_S": 0.5,
     "USE_OVERLAP": False,
     "OVERLAP_S": 0.0,
@@ -260,6 +265,30 @@ def build_experiment_signature_from_overrides(overrides):
             ),
             4,
         ),
+        round(
+            safe_float(
+                overrides.get(
+                    "TARGET_FALSE_ALARM_EPISODES_PER_MIN",
+                    overrides.get(
+                        "TARGET_FALSE_ALARMS_PER_MIN",
+                        FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+                    ),
+                ),
+                FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+            ),
+            4,
+        ),
+        normalize_optional_bool(
+            overrides.get("AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT"),
+            FIXED_OVERRIDES["AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT"],
+        ),
+        round(
+            safe_float(
+                overrides.get("AUTO_EVENT_RECALL_RETENTION"),
+                FIXED_OVERRIDES["AUTO_EVENT_RECALL_RETENTION"],
+            ),
+            4,
+        ),
         safe_int(overrides.get("RF_N_ESTIMATORS"), DEFAULT_RF_N_ESTIMATORS),
         round(safe_float(overrides.get("SVM_C"), DEFAULT_SVM_C), 6),
         str(overrides.get("SVM_GAMMA", DEFAULT_SVM_GAMMA)),
@@ -296,6 +325,24 @@ def derive_overrides_from_row(row):
         "TARGET_FALSE_ALARMS_PER_MIN": safe_float(
             row.get("config_target_false_alarms_per_min"),
             FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+        ),
+        "TARGET_FALSE_ALARM_EPISODES_PER_MIN": safe_float(
+            row.get("config_target_false_alarm_episodes_per_min"),
+            row.get("config_target_false_alarms_per_min")
+            or FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+        ),
+        "AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT": normalize_optional_bool(
+            row.get("config_auto_calibrate_false_alarm_episode_limit"),
+            FIXED_OVERRIDES["AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT"],
+        ),
+        "AUTO_EVENT_RECALL_RETENTION": safe_float(
+            row.get("config_auto_event_recall_retention"),
+            FIXED_OVERRIDES["AUTO_EVENT_RECALL_RETENTION"],
+        ),
+        "AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES": (
+            json.loads(row["config_auto_false_alarm_episode_limit_candidates"])
+            if row.get("config_auto_false_alarm_episode_limit_candidates")
+            else FIXED_OVERRIDES["AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES"]
         ),
         "RF_N_ESTIMATORS": safe_int(
             row.get("config_rf_n_estimators"),
@@ -349,13 +396,17 @@ def format_row_compact(row, rank=None):
         f"base={row.get('base_experiment_id')} | "
         f"winner={row.get('winner_name')} | "
         f"chunk={row.get('config_chunk_length_s')} s | "
+        f"feasible={normalize_optional_bool(row.get('selected_threshold_constraint_satisfied'), False)} | "
         f"overlap={row.get('config_use_overlap')} | "
         f"weights={row.get('config_use_class_weights')} | "
         f"augment={row.get('config_use_data_augmentation')} | "
+        f"val_event_recall={safe_metric(row, 'validation_event_recall', default=0.0):.4f} | "
+        f"val_macro_cov={safe_metric(row, 'validation_macro_event_coverage', default=0.0):.4f} | "
         f"val_f2={safe_metric(row, 'validation_f2', default=0.0):.4f} | "
-        f"val_recall={safe_metric(row, 'validation_recall', default=0.0):.4f} | "
         f"val_auc_pr={safe_metric(row, 'validation_auc_pr', default=0.0):.4f} | "
-        f"fa/min={safe_metric(row, 'validation_false_alarms_per_min', default=0.0):.2f}"
+        f"fa_epi/min={safe_metric(row, 'validation_false_alarm_episodes_per_min', default=0.0):.2f} | "
+        f"fa_chunk/min={safe_metric(row, 'validation_false_alarms_per_min', default=0.0):.2f} | "
+        f"fa_limit={safe_metric(row, 'selected_false_alarm_episode_limit', default=0.0):.2f}"
     )
 
 
@@ -379,6 +430,8 @@ def build_summary_row(
     validation_metrics = postprocess_data.get("validation_metrics") or {}
     validation_metrics_refit = postprocess_data.get("validation_metrics_refit") or {}
     test_metrics = postprocess_data.get("test_metrics") or {}
+    selection_threshold_info = postprocess_data.get("selection_threshold_info") or {}
+    final_threshold_info = postprocess_data.get("final_threshold_info") or {}
 
     return {
         "experiment_id": experiment_id,
@@ -442,6 +495,30 @@ def build_summary_row(
                 FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
             ),
         ),
+        "config_target_false_alarm_episodes_per_min": postprocess_data.get(
+            "target_false_alarm_episodes_per_min",
+            overrides.get(
+                "TARGET_FALSE_ALARM_EPISODES_PER_MIN",
+                overrides.get(
+                    "TARGET_FALSE_ALARMS_PER_MIN",
+                    FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+                ),
+            ),
+        ),
+        "config_auto_calibrate_false_alarm_episode_limit": postprocess_data.get(
+            "auto_calibrate_false_alarm_episode_limit",
+            overrides.get("AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT"),
+        ),
+        "config_auto_false_alarm_episode_limit_candidates": json.dumps(
+            postprocess_data.get(
+                "auto_false_alarm_episode_limit_candidates",
+                overrides.get("AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES"),
+            )
+        ),
+        "config_auto_event_recall_retention": postprocess_data.get(
+            "auto_event_recall_retention",
+            overrides.get("AUTO_EVENT_RECALL_RETENTION"),
+        ),
         "config_rf_n_estimators": overrides.get(
             "RF_N_ESTIMATORS",
             DEFAULT_RF_N_ESTIMATORS,
@@ -455,32 +532,68 @@ def build_summary_row(
         "recommended_chunk_threshold": postprocess_data.get(
             "recommended_chunk_threshold"
         ),
+        "selected_false_alarm_episode_limit": selection_threshold_info.get(
+            "selected_false_alarm_episode_limit",
+            postprocess_data.get(
+                "selected_false_alarm_episode_limit",
+                postprocess_data.get("target_false_alarm_episodes_per_min"),
+            ),
+        ),
+        "final_selected_false_alarm_episode_limit": final_threshold_info.get(
+            "selected_false_alarm_episode_limit",
+            postprocess_data.get(
+                "selected_false_alarm_episode_limit",
+                postprocess_data.get("target_false_alarm_episodes_per_min"),
+            ),
+        ),
+        "selected_threshold_constraint_satisfied": selection_threshold_info.get(
+            "constraint_satisfied"
+        ),
+        "final_threshold_constraint_satisfied": final_threshold_info.get(
+            "constraint_satisfied"
+        ),
+        "threshold_selection_metric": postprocess_data.get("threshold_selection_metric"),
         "bundle_path": postprocess_data.get("bundle_path"),
         "saved_bundles": postprocess_data.get("saved_bundles"),
         "run_output_dir": postprocess_data.get("run_output_dir"),
         "postprocess_json_path": postprocess_data.get("postprocess_json_path"),
         "log_path": str(log_path),
         "validation_precision": validation_metrics.get("precision"),
+        "validation_event_recall": validation_metrics.get("event_recall"),
+        "validation_macro_event_coverage": validation_metrics.get("macro_event_coverage"),
         "validation_recall": validation_metrics.get("recall"),
         "validation_f1": validation_metrics.get("f1"),
         "validation_f2": validation_metrics.get("f2"),
         "validation_auc_pr": validation_metrics.get("auc_pr"),
+        "validation_false_alarm_episodes_per_min": validation_metrics.get(
+            "false_alarm_episodes_per_min"
+        ),
         "validation_false_alarms_per_min": validation_metrics.get(
             "false_alarms_per_min"
         ),
         "validation_refit_precision": validation_metrics_refit.get("precision"),
+        "validation_refit_event_recall": validation_metrics_refit.get("event_recall"),
+        "validation_refit_macro_event_coverage": validation_metrics_refit.get(
+            "macro_event_coverage"
+        ),
         "validation_refit_recall": validation_metrics_refit.get("recall"),
         "validation_refit_f1": validation_metrics_refit.get("f1"),
         "validation_refit_f2": validation_metrics_refit.get("f2"),
         "validation_refit_auc_pr": validation_metrics_refit.get("auc_pr"),
+        "validation_refit_false_alarm_episodes_per_min": validation_metrics_refit.get(
+            "false_alarm_episodes_per_min"
+        ),
         "validation_refit_false_alarms_per_min": validation_metrics_refit.get(
             "false_alarms_per_min"
         ),
         "test_precision": test_metrics.get("precision"),
+        "test_event_recall": test_metrics.get("event_recall"),
+        "test_macro_event_coverage": test_metrics.get("macro_event_coverage"),
         "test_recall": test_metrics.get("recall"),
         "test_f1": test_metrics.get("f1"),
         "test_f2": test_metrics.get("f2"),
         "test_auc_pr": test_metrics.get("auc_pr"),
+        "test_false_alarm_episodes_per_min": test_metrics.get("false_alarm_episodes_per_min"),
         "test_false_alarms_per_min": test_metrics.get("false_alarms_per_min"),
     }
 
@@ -507,17 +620,40 @@ def find_new_postprocess_json(output_dir, run_name_prefix, previous_matches):
 
 def rank_rows(rows):
     successful_rows = [row for row in rows if row["status"] == "ok"]
-    successful_rows.sort(
-        key=lambda row: (
+
+    def build_rank_key(row):
+        constraint_satisfied = normalize_optional_bool(
+            row.get("selected_threshold_constraint_satisfied"),
+            False,
+        )
+        if constraint_satisfied:
+            return (
+                1,
+                safe_metric(row, PRIMARY_RANK_METRIC),
+                safe_metric(row, SECONDARY_RANK_METRIC),
+                safe_metric(row, TERTIARY_RANK_METRIC),
+                safe_metric(row, "validation_recall"),
+                safe_metric(row, QUATERNARY_RANK_METRIC),
+                -safe_metric(row, FALSE_ALARM_RANK_METRIC, default=1e9),
+            )
+
+        return (
+            0,
             safe_metric(row, PRIMARY_RANK_METRIC),
+            -safe_metric(row, FALSE_ALARM_RANK_METRIC, default=1e9),
             safe_metric(row, SECONDARY_RANK_METRIC),
             safe_metric(row, TERTIARY_RANK_METRIC),
+            safe_metric(row, "validation_recall"),
+            safe_metric(row, QUATERNARY_RANK_METRIC),
             -safe_metric(
                 row,
                 "validation_false_alarms_per_min",
                 default=1e9,
             ),
-        ),
+        )
+
+    successful_rows.sort(
+        key=build_rank_key,
         reverse=True,
     )
     return successful_rows
@@ -606,8 +742,11 @@ def build_refinement_mutations(parent_row):
     )
     current_target_false_alarms = float(
         parent_overrides.get(
-            "TARGET_FALSE_ALARMS_PER_MIN",
-            FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+            "TARGET_FALSE_ALARM_EPISODES_PER_MIN",
+            parent_overrides.get(
+                "TARGET_FALSE_ALARMS_PER_MIN",
+                FIXED_OVERRIDES["TARGET_FALSE_ALARMS_PER_MIN"],
+            ),
         )
     )
 
@@ -721,7 +860,10 @@ def build_refinement_mutations(parent_row):
             mutations.append(
                 (
                     f"fa_{prob_tag(target_false_alarms)}",
-                    {"TARGET_FALSE_ALARMS_PER_MIN": target_false_alarms},
+                    {
+                        "TARGET_FALSE_ALARMS_PER_MIN": target_false_alarms,
+                        "TARGET_FALSE_ALARM_EPISODES_PER_MIN": target_false_alarms,
+                    },
                     "Cambia la restriccion de falsas alarmas por minuto usada al calibrar.",
                 )
             )

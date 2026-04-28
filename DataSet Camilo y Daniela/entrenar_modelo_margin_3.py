@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import hashlib
 from datetime import datetime
 
@@ -169,6 +170,24 @@ THRESHOLD_GRID = np.array(
     dtype=np.float32,
 )
 TARGET_FALSE_ALARMS_PER_MIN = float(get_config_value("TARGET_FALSE_ALARMS_PER_MIN", 1.0))
+TARGET_FALSE_ALARM_EPISODES_PER_MIN = float(
+    get_config_value(
+        "TARGET_FALSE_ALARM_EPISODES_PER_MIN",
+        TARGET_FALSE_ALARMS_PER_MIN,
+    )
+)
+MIN_EVENT_HIT_DURATION_S = float(get_config_value("MIN_EVENT_HIT_DURATION_S", 1.0))
+AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT = bool(
+    get_config_value("AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT", False)
+)
+AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES = [
+    float(limit)
+    for limit in get_config_value(
+        "AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES",
+        [0.5, 1.0, 2.0, 3.0, 5.0, 10.0],
+    )
+]
+AUTO_EVENT_RECALL_RETENTION = float(get_config_value("AUTO_EVENT_RECALL_RETENTION", 0.95))
 
 # ---------------------------------------------------------------------------
 # Opciones activables del entrenamiento y evaluacion
@@ -253,6 +272,10 @@ SPECTROGRAM_NORMALIZATION = str(get_config_value("SPECTROGRAM_NORMALIZATION", "m
 # Si es True, muestra las graficas de loss, precision, recall, AUC-PR y F1.
 # Puede desactivarse si se quiere ejecutar el script de forma mas automatizada.
 SHOW_TRAINING_PLOTS = bool(get_config_value("SHOW_TRAINING_PLOTS", True))
+
+# Si es True, guarda las graficas principales del entrenamiento en
+# `RUN_OUTPUT_DIR` aunque no se muestren por pantalla.
+SAVE_TRAINING_PLOTS = bool(get_config_value("SAVE_TRAINING_PLOTS", True))
 
 # Si es True, busca un umbral de referencia para convertir probabilidades
 # en decisiones binarias solo con fines de analisis.
@@ -424,7 +447,49 @@ validate_split_configuration()
 # Como aqui se entrena en CPU, repartir los hilos suele rendir mejor que dar
 # todos los cores a TensorFlow y dejar el generador en serie.
 # ---------------------------------------------------------------------------
-LOGICAL_CPU_COUNT = max(1, os.cpu_count() or 1)
+def get_positive_int_env_var(name):
+    """Lee un entero positivo desde el entorno o devuelve None."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return None
+
+    raw_value = str(raw_value).strip()
+    if not raw_value:
+        return None
+
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        return None
+
+    return parsed_value if parsed_value > 0 else None
+
+
+def parse_visible_cuda_devices():
+    """Resume CUDA_VISIBLE_DEVICES en una lista estable para logging."""
+    raw_value = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw_value is None:
+        return None
+
+    normalized_value = str(raw_value).strip()
+    if not normalized_value or normalized_value in {"-1", "none", "void"}:
+        return []
+
+    return [item.strip() for item in normalized_value.split(",") if item.strip()]
+
+
+SYSTEM_LOGICAL_CPU_COUNT = max(1, os.cpu_count() or 1)
+SLURM_CPUS_PER_TASK = get_positive_int_env_var("SLURM_CPUS_PER_TASK")
+LOGICAL_CPU_COUNT = (
+    max(1, min(SYSTEM_LOGICAL_CPU_COUNT, SLURM_CPUS_PER_TASK))
+    if SLURM_CPUS_PER_TASK is not None
+    else SYSTEM_LOGICAL_CPU_COUNT
+)
+SLURM_JOB_ID = os.environ.get("SLURM_JOB_ID")
+SLURM_JOB_NODELIST = os.environ.get("SLURM_JOB_NODELIST") or os.environ.get(
+    "SLURMD_NODENAME"
+)
+CUDA_VISIBLE_DEVICE_LIST = parse_visible_cuda_devices()
 PYDATASET_WORKERS = int(
     get_config_value("PYDATASET_WORKERS", max(1, min(8, LOGICAL_CPU_COUNT // 4)))
 )
@@ -471,11 +536,17 @@ DATASET_DIR = os.path.join(SCRIPT_DIR, "dataset")
 METADATA_PATH = os.path.join(DATASET_DIR, "metadata", "master_index.csv")
 RUN_OUTPUT_DIR = os.path.normpath(str(get_config_value("RUN_OUTPUT_DIR", SCRIPT_DIR)))
 RUN_NAME_PREFIX = str(get_config_value("RUN_NAME_PREFIX", "modelo_sirenas_margin_3"))
-RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 RUN_BASENAME = f"{RUN_NAME_PREFIX}_{RUN_TIMESTAMP}"
 MODEL_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}.keras")
 POSTPROCESSING_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}_postprocesado.json")
 CONFUSION_REPORT_PATH = os.path.join(RUN_OUTPUT_DIR, f"{RUN_BASENAME}_matrices_confusion.txt")
+PLOTS_ROOT_DIR = os.path.join(RUN_OUTPUT_DIR, RUN_BASENAME)
+PLOT_STAGE_DIRS = {
+    "train": os.path.join(PLOTS_ROOT_DIR, f"train_{RUN_BASENAME}"),
+    "validation": os.path.join(PLOTS_ROOT_DIR, f"validation_{RUN_BASENAME}"),
+    "test": os.path.join(PLOTS_ROOT_DIR, f"test_{RUN_BASENAME}"),
+}
 SPLIT_MANIFEST_PATH = os.path.join(
     DATASET_DIR,
     "metadata",
@@ -505,13 +576,58 @@ def configure_tensorflow_cpu_runtime():
         )
 
 
+def configure_tensorflow_gpu_runtime():
+    """
+    Activa memory growth en GPUs visibles para convivir mejor con nodos compartidos.
+    """
+    gpu_devices = tf.config.list_physical_devices("GPU")
+    for gpu_device in gpu_devices:
+        try:
+            tf.config.experimental.set_memory_growth(gpu_device, True)
+        except RuntimeError as exc:
+            print(
+                "Aviso: no se ha podido activar memory growth para "
+                f"{gpu_device.name} ({exc})."
+            )
+    return gpu_devices
+
+
+def print_runtime_cluster_context():
+    """Muestra el contexto de recursos visibles para este proceso."""
+    if CUDA_VISIBLE_DEVICE_LIST is None:
+        visible_cuda_devices = "no_definido"
+    elif not CUDA_VISIBLE_DEVICE_LIST:
+        visible_cuda_devices = "sin_gpu_visible"
+    else:
+        visible_cuda_devices = ",".join(CUDA_VISIBLE_DEVICE_LIST)
+
+    tf_visible_gpu_names = ", ".join(device.name for device in TF_VISIBLE_GPU_DEVICES)
+    if not tf_visible_gpu_names:
+        tf_visible_gpu_names = "ninguna"
+
+    print(
+        "Contexto SLURM/GPU -> job_id: {job_id} | nodo: {node} | "
+        "cpus_per_task: {cpus} | CUDA_VISIBLE_DEVICES: {cuda_devices} | "
+        "TF GPUs visibles: {tf_gpu_count} ({tf_gpu_names})".format(
+            job_id=SLURM_JOB_ID or "local",
+            node=SLURM_JOB_NODELIST or "local",
+            cpus=SLURM_CPUS_PER_TASK or "sin_limite_explicito",
+            cuda_devices=visible_cuda_devices,
+            tf_gpu_count=len(TF_VISIBLE_GPU_DEVICES),
+            tf_gpu_names=tf_visible_gpu_names,
+        )
+    )
+
+
 def print_parallelism_configuration():
     """Muestra por pantalla como se reparte la CPU en este experimento."""
     print(
-        "Configuracion de CPU -> hilos logicos: {logical} | "
+        "Configuracion de CPU -> hilos sistema: {system_logical} | "
+        "hilos efectivos: {logical} | "
         "TF intra_op: {intra} | TF inter_op: {inter} | "
         "PyDataset workers: {workers} | multiprocessing: {multiprocessing} | "
         "cola maxima: {queue}".format(
+            system_logical=SYSTEM_LOGICAL_CPU_COUNT,
             logical=LOGICAL_CPU_COUNT,
             intra=TF_INTRA_OP_THREADS,
             inter=TF_INTER_OP_THREADS,
@@ -523,6 +639,7 @@ def print_parallelism_configuration():
 
 
 configure_tensorflow_cpu_runtime()
+TF_VISIBLE_GPU_DEVICES = configure_tensorflow_gpu_runtime()
 np.random.seed(RANDOM_SEED)
 tf.random.set_seed(RANDOM_SEED)
 
@@ -1779,9 +1896,12 @@ def build_split_manifest(df_master, stratify_columns):
     )
 
     split_labels = pd.Series("unassigned", index=df_master.index, dtype="object")
-    split_labels.iloc[train_idx] = "train"
-    split_labels.iloc[temp_df.iloc[validation_idx].index] = "validation"
-    split_labels.iloc[temp_df.iloc[test_idx].index] = "test"
+    # grouped_stratified_split devuelve etiquetas de indice del DataFrame recibido,
+    # no posiciones relativas. Aqui hay que asignar por .loc para no desalinear el
+    # segundo split (validation/test) cuando temp_df conserva indices originales.
+    split_labels.loc[train_idx] = "train"
+    split_labels.loc[validation_idx] = "validation"
+    split_labels.loc[test_idx] = "test"
 
     manifest_df = df_master.loc[
         :,
@@ -1954,7 +2074,13 @@ class AudioDataGenerator(Sequence):
         valid_mask = self.df["num_chunks"] > 0 if "num_chunks" in self.df.columns else np.ones(len(self.df), dtype=bool)
         self.class_row_indices = {}
         for class_id in sorted(self.df["target"].unique()):
-            class_indices = self.df.index[valid_mask & (self.df["target"] == class_id)].to_numpy()
+            # Pandas puede devolver vistas no escribibles; el generador las baraja
+            # in-place al final de cada epoca, asi que aqui necesitamos una copia.
+            class_indices = (
+                self.df.index[valid_mask & (self.df["target"] == class_id)]
+                .to_numpy(copy=True)
+                .astype(np.int64, copy=False)
+            )
             if len(class_indices) > 0:
                 self.class_row_indices[int(class_id)] = class_indices
 
@@ -2254,11 +2380,13 @@ def collect_chunk_predictions(model, df, base_path):
     Recorre un conjunto de audios y devuelve:
     - etiquetas reales por chunk
     - probabilidades predichas por chunk
+    - predicciones agrupadas por audio para metricas por evento
 
     Esta funcion se usa para evaluar fuera de `model.fit`, de forma mas flexible.
     """
     y_true_all = []
     y_score_all = []
+    audio_prediction_records = []
 
     for _, row in df.iterrows():
         audio_path = os.path.normpath(os.path.join(base_path, row["path"]))
@@ -2273,10 +2401,149 @@ def collect_chunk_predictions(model, df, base_path):
         y_true_all.append(labels)
         y_score_all.append(scores)
 
-    if not y_true_all:
-        return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
+        audio_prediction_records.append(
+            {
+                "path": str(row["path"]),
+                "label": str(row.get("label", "")).strip().lower(),
+                "target": int(row["target"]),
+                "source": None if pd.isna(row.get("source", pd.NA)) else str(row.get("source")).strip(),
+                "group_id": None if pd.isna(row.get("group_id", pd.NA)) else str(row.get("group_id")).strip(),
+                "siren_id": None if pd.isna(row.get("siren_id", pd.NA)) else str(row.get("siren_id")).strip(),
+                "safe_group_id": None
+                if pd.isna(row.get("safe_group_id", pd.NA))
+                else str(row.get("safe_group_id")).strip(),
+                "num_chunks": int(len(scores)),
+                "scores": scores,
+            }
+        )
 
-    return np.concatenate(y_true_all), np.concatenate(y_score_all)
+    if not y_true_all:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.float32), []
+
+    return np.concatenate(y_true_all), np.concatenate(y_score_all), audio_prediction_records
+
+
+def chunk_count_to_duration_s(
+    num_chunks,
+    chunk_length_s=CHUNK_LENGTH_S,
+    chunk_step_s=CHUNK_STEP_S,
+):
+    """Convierte un numero de chunks consecutivos en duracion temporal efectiva."""
+    if num_chunks <= 0:
+        return 0.0
+    return float(chunk_length_s + max(0, int(num_chunks) - 1) * chunk_step_s)
+
+
+def compute_positive_run_lengths(binary_sequence):
+    """Devuelve las longitudes de las rachas consecutivas de positivos."""
+    binary_array = np.asarray(binary_sequence, dtype=np.int32).reshape(-1)
+    if binary_array.size == 0:
+        return np.array([], dtype=np.int32)
+
+    padded = np.pad(binary_array, (1, 1), mode="constant", constant_values=0)
+    transitions = np.diff(padded)
+    run_starts = np.where(transitions == 1)[0]
+    run_ends = np.where(transitions == -1)[0]
+    return (run_ends - run_starts).astype(np.int32)
+
+
+def count_positive_episodes(
+    binary_sequence,
+    min_duration_s=MIN_EVENT_HIT_DURATION_S,
+    chunk_length_s=CHUNK_LENGTH_S,
+    chunk_step_s=CHUNK_STEP_S,
+):
+    """
+    Cuenta rachas positivas cuya duracion supera el minimo exigido.
+
+    Se usa tanto para detectar eventos reales de sirena como episodios de falsa
+    alarma sobre audios de background.
+    """
+    run_lengths = compute_positive_run_lengths(binary_sequence)
+    if run_lengths.size == 0:
+        return 0
+
+    qualifying_runs = [
+        run_length
+        for run_length in run_lengths
+        if chunk_count_to_duration_s(run_length, chunk_length_s, chunk_step_s) >= min_duration_s
+    ]
+    return int(len(qualifying_runs))
+
+
+def compute_event_metrics(
+    audio_prediction_records,
+    threshold,
+    min_event_hit_duration_s=MIN_EVENT_HIT_DURATION_S,
+    chunk_length_s=CHUNK_LENGTH_S,
+    chunk_step_s=CHUNK_STEP_S,
+):
+    """
+    Calcula metricas centradas en eventos reales y episodios de falsa alarma.
+
+    Definiciones:
+    - `event_recall`: fraccion de audios de sirena que contienen al menos una
+      racha positiva con duracion >= `min_event_hit_duration_s`.
+    - `macro_event_coverage`: media por audio de sirena del porcentaje de chunks
+      detectados como positivos.
+    - `false_alarm_episodes_per_min`: numero de rachas positivas validas por
+      minuto de audio background.
+    """
+    total_positive_events = 0
+    detected_positive_events = 0
+    false_alarm_episode_count = 0
+    background_duration_s = 0.0
+    event_coverages = []
+
+    for record in audio_prediction_records or []:
+        scores = np.asarray(record["scores"], dtype=np.float32).reshape(-1)
+        if scores.size == 0:
+            continue
+
+        binary_predictions = (scores >= threshold).astype(np.int32)
+        positive_episode_count = count_positive_episodes(
+            binary_predictions,
+            min_duration_s=min_event_hit_duration_s,
+            chunk_length_s=chunk_length_s,
+            chunk_step_s=chunk_step_s,
+        )
+
+        if int(record["target"]) == 1:
+            total_positive_events += 1
+            event_coverages.append(float(np.mean(binary_predictions)))
+            if positive_episode_count > 0:
+                detected_positive_events += 1
+        else:
+            background_duration_s += chunk_count_to_duration_s(
+                len(binary_predictions),
+                chunk_length_s=chunk_length_s,
+                chunk_step_s=chunk_step_s,
+            )
+            false_alarm_episode_count += positive_episode_count
+
+    event_recall = (
+        float(detected_positive_events / total_positive_events)
+        if total_positive_events > 0
+        else 0.0
+    )
+    macro_event_coverage = float(np.mean(event_coverages)) if event_coverages else 0.0
+    background_duration_min = background_duration_s / 60.0 if background_duration_s > 0.0 else 0.0
+    false_alarm_episodes_per_min = (
+        float(false_alarm_episode_count / background_duration_min)
+        if background_duration_min > 0.0
+        else 0.0
+    )
+
+    return {
+        "event_recall": event_recall,
+        "macro_event_coverage": macro_event_coverage,
+        "detected_positive_event_count": int(detected_positive_events),
+        "total_positive_event_count": int(total_positive_events),
+        "false_alarm_episode_count": int(false_alarm_episode_count),
+        "background_duration_min": float(background_duration_min),
+        "false_alarm_episodes_per_min": false_alarm_episodes_per_min,
+        "min_event_hit_duration_s": float(min_event_hit_duration_s),
+    }
 
 
 def compute_metrics(y_true, y_pred, y_score, chunk_step_s=CHUNK_STEP_S):
@@ -2313,7 +2580,191 @@ def compute_metrics(y_true, y_pred, y_score, chunk_step_s=CHUNK_STEP_S):
     }
 
 
-def select_best_threshold(y_true, y_scores, target_false_alarms_per_min=TARGET_FALSE_ALARMS_PER_MIN):
+def compute_decision_metrics(
+    y_true,
+    y_scores,
+    threshold,
+    audio_prediction_records=None,
+    chunk_step_s=CHUNK_STEP_S,
+    min_event_hit_duration_s=MIN_EVENT_HIT_DURATION_S,
+):
+    """
+    Combina metricas chunk a chunk con metricas por evento para un umbral dado.
+    """
+    y_pred = (y_scores >= threshold).astype(np.int32)
+    metrics = compute_metrics(y_true, y_pred, y_scores, chunk_step_s=chunk_step_s)
+    metrics.update(
+        compute_event_metrics(
+            audio_prediction_records,
+            threshold=threshold,
+            min_event_hit_duration_s=min_event_hit_duration_s,
+            chunk_length_s=CHUNK_LENGTH_S,
+            chunk_step_s=chunk_step_s,
+        )
+    )
+    return metrics
+
+
+def select_best_threshold_row_from_table(
+    threshold_df,
+    target_false_alarm_episodes_per_min,
+):
+    """
+    Selecciona la mejor fila de la tabla de thresholds para un limite dado.
+
+    Si existe al menos un threshold que cumpla el limite de episodios falsos por
+    minuto, la decision prioriza `event_recall` y usa la cobertura media por
+    evento como segundo criterio. Si ninguno cumple, se elige el menos malo
+    manteniendo `event_recall` como prioridad principal.
+    """
+    allowed = threshold_df[
+        threshold_df["false_alarm_episodes_per_min"] <= target_false_alarm_episodes_per_min
+    ]
+
+    if not allowed.empty:
+        best_row = allowed.sort_values(
+            by=["event_recall", "macro_event_coverage", "f2", "recall", "threshold"],
+            ascending=[False, False, False, False, False],
+        ).iloc[0]
+        return best_row, True
+
+    best_row = threshold_df.sort_values(
+        by=[
+            "event_recall",
+            "false_alarm_episodes_per_min",
+            "macro_event_coverage",
+            "f2",
+            "recall",
+            "threshold",
+        ],
+        ascending=[False, True, False, False, False, False],
+    ).iloc[0]
+    return best_row, False
+
+
+def auto_calibrate_false_alarm_episode_limit(
+    threshold_df,
+    requested_limit,
+    candidate_limits=None,
+    event_recall_retention=AUTO_EVENT_RECALL_RETENTION,
+):
+    """
+    Escoge automaticamente el menor limite que retiene casi todo el event recall.
+
+    Criterio:
+    - se calcula el mejor threshold para cada limite candidato;
+    - se mide el `event_recall` obtenido con ese threshold;
+    - se elige el menor limite que conserve al menos un porcentaje fijo del
+      `event_recall` maximo alcanzable en validation.
+    """
+    if threshold_df is None or threshold_df.empty:
+        empty_info = {
+            "requested_limit": float(requested_limit),
+            "selected_limit": float(requested_limit),
+            "event_recall_retention": float(event_recall_retention),
+            "max_event_recall": 0.0,
+            "min_required_event_recall": 0.0,
+            "selection_reason": "empty_threshold_table",
+            "candidate_summaries": [],
+        }
+        return float(requested_limit), empty_info
+
+    raw_limits = candidate_limits if candidate_limits is not None else []
+    normalized_candidates = {
+        round(float(limit), 6)
+        for limit in raw_limits
+        if float(limit) > 0.0
+    }
+    normalized_candidates.add(round(float(requested_limit), 6))
+    candidate_limits_sorted = sorted(normalized_candidates)
+
+    max_event_recall = float(threshold_df["event_recall"].max())
+    min_required_event_recall = float(
+        max(0.0, min(1.0, float(event_recall_retention))) * max_event_recall
+    )
+
+    candidate_summaries = []
+    for candidate_limit in candidate_limits_sorted:
+        best_row, constraint_satisfied = select_best_threshold_row_from_table(
+            threshold_df,
+            candidate_limit,
+        )
+        candidate_summary = {
+            "candidate_limit": float(candidate_limit),
+            "constraint_satisfied": bool(constraint_satisfied),
+            "selected_threshold": float(best_row["threshold"]),
+            "selected_event_recall": float(best_row["event_recall"]),
+            "selected_macro_event_coverage": float(best_row["macro_event_coverage"]),
+            "selected_f2": float(best_row["f2"]),
+            "selected_recall": float(best_row["recall"]),
+            "selected_false_alarm_episodes_per_min": float(
+                best_row["false_alarm_episodes_per_min"]
+            ),
+            "selected_false_alarms_per_min": float(best_row["false_alarms_per_min"]),
+            "meets_event_recall_retention": bool(
+                constraint_satisfied
+                and float(best_row["event_recall"]) >= (min_required_event_recall - 1e-12)
+            ),
+        }
+        candidate_summaries.append(candidate_summary)
+
+    eligible_candidates = [
+        candidate for candidate in candidate_summaries if candidate["meets_event_recall_retention"]
+    ]
+    if eligible_candidates:
+        chosen_candidate = eligible_candidates[0]
+        selection_reason = "smallest_feasible_limit_retaining_target_event_recall"
+    else:
+        feasible_candidates = [
+            candidate for candidate in candidate_summaries if candidate["constraint_satisfied"]
+        ]
+        if feasible_candidates:
+            chosen_candidate = sorted(
+                feasible_candidates,
+                key=lambda candidate: (
+                    -candidate["selected_event_recall"],
+                    -candidate["selected_macro_event_coverage"],
+                    -candidate["selected_f2"],
+                    candidate["candidate_limit"],
+                ),
+            )[0]
+            selection_reason = "best_feasible_limit_by_event_metrics"
+        else:
+            chosen_candidate = {
+                "candidate_limit": float(requested_limit),
+                "constraint_satisfied": False,
+                "selected_threshold": None,
+                "selected_event_recall": 0.0,
+                "selected_macro_event_coverage": 0.0,
+                "selected_f2": 0.0,
+                "selected_recall": 0.0,
+                "selected_false_alarm_episodes_per_min": float("nan"),
+                "selected_false_alarms_per_min": float("nan"),
+                "meets_event_recall_retention": False,
+            }
+            selection_reason = "no_feasible_candidate_limit"
+
+    calibration_info = {
+        "requested_limit": float(requested_limit),
+        "selected_limit": float(chosen_candidate["candidate_limit"]),
+        "event_recall_retention": float(event_recall_retention),
+        "max_event_recall": float(max_event_recall),
+        "min_required_event_recall": float(min_required_event_recall),
+        "selection_reason": selection_reason,
+        "candidate_summaries": candidate_summaries,
+    }
+    return float(chosen_candidate["candidate_limit"]), calibration_info
+
+
+def select_best_threshold(
+    y_true,
+    y_scores,
+    audio_prediction_records,
+    target_false_alarm_episodes_per_min=TARGET_FALSE_ALARM_EPISODES_PER_MIN,
+    auto_calibrate_limit=AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT,
+    auto_false_alarm_episode_limit_candidates=AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES,
+    auto_event_recall_retention=AUTO_EVENT_RECALL_RETENTION,
+):
     """
     Busca un umbral de referencia para convertir probabilidades en binario.
 
@@ -2321,66 +2772,247 @@ def select_best_threshold(y_true, y_scores, target_false_alarms_per_min=TARGET_F
     - El modelo produce probabilidades por chunk.
     - Este umbral se usa solo como analisis auxiliar.
     - La decision final en produccion puede usar otra logica externa.
-    - La seleccion prioriza F2 para dar mas peso al recall que a la precision.
+    - La seleccion prioriza detectar eventos reales de sirena.
     """
-    threshold_rows = []
+    threshold_df = build_threshold_table(
+        y_true,
+        y_scores,
+        audio_prediction_records=audio_prediction_records,
+    )
+    effective_false_alarm_episode_limit = float(target_false_alarm_episodes_per_min)
+    calibration_info = {
+        "requested_limit": float(target_false_alarm_episodes_per_min),
+        "selected_limit": float(target_false_alarm_episodes_per_min),
+        "event_recall_retention": float(auto_event_recall_retention),
+        "max_event_recall": float(threshold_df["event_recall"].max()) if not threshold_df.empty else 0.0,
+        "min_required_event_recall": float(
+            threshold_df["event_recall"].max()
+            * max(0.0, min(1.0, float(auto_event_recall_retention)))
+        )
+        if not threshold_df.empty
+        else 0.0,
+        "selection_reason": "fixed_limit",
+        "candidate_summaries": [],
+    }
 
-    for threshold in THRESHOLD_GRID:
-        y_pred = (y_scores >= threshold).astype(np.int32)
-        metrics = compute_metrics(y_true, y_pred, y_scores)
-        threshold_rows.append({"threshold": float(threshold), **metrics})
+    if auto_calibrate_limit:
+        effective_false_alarm_episode_limit, calibration_info = (
+            auto_calibrate_false_alarm_episode_limit(
+                threshold_df,
+                requested_limit=target_false_alarm_episodes_per_min,
+                candidate_limits=auto_false_alarm_episode_limit_candidates,
+                event_recall_retention=auto_event_recall_retention,
+            )
+        )
 
-    threshold_df = pd.DataFrame(threshold_rows)
-    allowed = threshold_df[threshold_df["false_alarms_per_min"] <= target_false_alarms_per_min]
+    best_row, constraint_satisfied = select_best_threshold_row_from_table(
+        threshold_df,
+        effective_false_alarm_episode_limit,
+    )
+    calibration_info["selected_threshold_constraint_satisfied"] = bool(constraint_satisfied)
+    calibration_info["selected_threshold"] = float(best_row["threshold"])
 
-    if not allowed.empty:
-        best_row = allowed.sort_values(
-            by=["f2", "recall", "precision", "threshold"],
-            ascending=[False, False, False, False],
-        ).iloc[0]
-    else:
-        best_row = threshold_df.sort_values(
-            by=["false_alarms_per_min", "f2", "recall"],
-            ascending=[True, False, False],
-        ).iloc[0]
-
-    return float(best_row["threshold"]), threshold_df
+    return (
+        float(best_row["threshold"]),
+        threshold_df,
+        float(effective_false_alarm_episode_limit),
+        calibration_info,
+    )
 
 
-def plot_training_history(history):
-    """Dibuja la evolucion de las metricas principales durante el entrenamiento."""
-    history_dict = history.history
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+def prepare_plot_output_dirs():
+    """Recrea la jerarquia de plots por etapa para esta ejecucion."""
+    if os.path.isdir(PLOTS_ROOT_DIR):
+        shutil.rmtree(PLOTS_ROOT_DIR)
+    os.makedirs(PLOTS_ROOT_DIR, exist_ok=True)
+    for stage_dir in PLOT_STAGE_DIRS.values():
+        os.makedirs(stage_dir, exist_ok=True)
 
-    axes[0, 0].plot(history_dict["loss"], label="Entrenamiento")
-    axes[0, 0].plot(history_dict["val_loss"], label="Validacion")
-    axes[0, 0].set_title("Loss")
-    axes[0, 0].set_xlabel("Epocas")
-    axes[0, 0].set_ylabel("Binary Crossentropy")
-    axes[0, 0].legend()
 
-    axes[0, 1].plot(history_dict["precision"], label="Precision train")
-    axes[0, 1].plot(history_dict["val_precision"], label="Precision val")
-    axes[0, 1].plot(history_dict["recall"], label="Recall train")
-    axes[0, 1].plot(history_dict["val_recall"], label="Recall val")
-    axes[0, 1].set_title("Precision y Recall")
-    axes[0, 1].set_xlabel("Epocas")
-    axes[0, 1].legend()
+def compute_fbeta_from_precision_recall(precision_values, recall_values, beta=2.0):
+    precision_array = np.asarray(precision_values, dtype=float)
+    recall_array = np.asarray(recall_values, dtype=float)
+    beta_sq = float(beta) ** 2
+    denominator = (beta_sq * precision_array) + recall_array
+    return np.where(
+        denominator > 0.0,
+        ((1.0 + beta_sq) * precision_array * recall_array) / denominator,
+        0.0,
+    )
 
-    axes[1, 0].plot(history_dict["auc_pr"], label="AUC-PR train")
-    axes[1, 0].plot(history_dict["val_auc_pr"], label="AUC-PR val")
-    axes[1, 0].set_title("AUC-PR")
-    axes[1, 0].set_xlabel("Epocas")
-    axes[1, 0].legend()
 
-    axes[1, 1].plot(history_dict["f1"], label="F1 train")
-    axes[1, 1].plot(history_dict["val_f1"], label="F1 val")
-    axes[1, 1].set_title("F1")
-    axes[1, 1].set_xlabel("Epocas")
-    axes[1, 1].legend()
+def save_single_metric_plot(
+    x_values,
+    y_values,
+    title,
+    xlabel,
+    ylabel,
+    save_path,
+    show=False,
+    color="#1f77b4",
+    selected_x=None,
+    selected_label=None,
+    target_y=None,
+    target_label=None,
+):
+    """Guarda una grafica simple de una sola metrica."""
+    fig, axis = plt.subplots(figsize=(10, 5))
+    axis.plot(
+        x_values,
+        y_values,
+        marker="o",
+        linewidth=2.0,
+        color=color,
+        label=ylabel,
+    )
+    axis.set_title(title)
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel(ylabel)
+    axis.grid(alpha=0.25)
+
+    if selected_x is not None:
+        axis.axvline(
+            selected_x,
+            color="#d62728",
+            linestyle="--",
+            linewidth=1.5,
+            label=selected_label or f"Referencia ({selected_x:.2f})",
+        )
+    if target_y is not None:
+        axis.axhline(
+            target_y,
+            color="#2ca02c",
+            linestyle=":",
+            linewidth=1.5,
+            label=target_label or f"Objetivo ({target_y:.2f})",
+        )
+
+    if selected_x is not None or target_y is not None:
+        axis.legend()
 
     fig.tight_layout()
-    plt.show()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Grafica guardada en: {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def save_training_history_plots(history, show=False):
+    """Guarda una imagen por metrica y por etapa para train/validation."""
+    history_dict = {key: list(values) for key, values in history.history.items()}
+    epochs = np.arange(1, len(history_dict["loss"]) + 1, dtype=int)
+
+    history_dict["f2"] = compute_fbeta_from_precision_recall(
+        history_dict["precision"],
+        history_dict["recall"],
+        beta=2.0,
+    ).tolist()
+    history_dict["val_f2"] = compute_fbeta_from_precision_recall(
+        history_dict["val_precision"],
+        history_dict["val_recall"],
+        beta=2.0,
+    ).tolist()
+
+    stage_specs = {
+        "train": [
+            ("loss", "Loss", "Binary Crossentropy", "#4e79a7"),
+            ("precision", "Precision", "Precision", "#f28e2b"),
+            ("recall", "Recall", "Recall", "#59a14f"),
+            ("auc_pr", "AUC-PR", "AUC-PR", "#e15759"),
+            ("f1", "F1", "F1", "#9c755f"),
+            ("f2", "F2", "F2", "#76b7b2"),
+        ],
+        "validation": [
+            ("val_loss", "Loss", "Binary Crossentropy", "#4e79a7"),
+            ("val_precision", "Precision", "Precision", "#f28e2b"),
+            ("val_recall", "Recall", "Recall", "#59a14f"),
+            ("val_auc_pr", "AUC-PR", "AUC-PR", "#e15759"),
+            ("val_f1", "F1", "F1", "#9c755f"),
+            ("val_f2", "F2", "F2", "#76b7b2"),
+        ],
+    }
+
+    for stage_name, metric_specs in stage_specs.items():
+        stage_dir = PLOT_STAGE_DIRS[stage_name]
+        for history_key, metric_slug, ylabel, color in metric_specs:
+            if history_key not in history_dict:
+                continue
+            save_single_metric_plot(
+                epochs,
+                history_dict[history_key],
+                title=f"{stage_name.capitalize()} | {ylabel} por epoca",
+                xlabel="Epocas",
+                ylabel=ylabel,
+                save_path=os.path.join(stage_dir, f"{metric_slug.lower()}.png"),
+                show=show,
+                color=color,
+            )
+
+
+def build_threshold_table(y_true, y_scores, audio_prediction_records=None):
+    """Calcula una tabla completa de metricas para cada umbral configurado."""
+    threshold_rows = []
+    for threshold in THRESHOLD_GRID:
+        metrics = compute_decision_metrics(
+            y_true,
+            y_scores,
+            threshold=float(threshold),
+            audio_prediction_records=audio_prediction_records,
+        )
+        threshold_rows.append({"threshold": float(threshold), **metrics})
+    return pd.DataFrame(threshold_rows)
+
+
+def save_threshold_metric_plots(
+    threshold_table,
+    stage_name,
+    selected_threshold,
+    target_false_alarm_episodes_per_min,
+    show=False,
+):
+    """Guarda por separado las metricas clave del barrido de umbrales."""
+    if threshold_table is None or threshold_table.empty:
+        return
+
+    stage_dir = PLOT_STAGE_DIRS[stage_name]
+    plot_specs = [
+        ("event_recall", "Event recall", "#4e79a7", None, None),
+        ("macro_event_coverage", "Macro event coverage", "#59a14f", None, None),
+        ("f2", "F2", "#1f77b4", None, None),
+        (
+            "false_alarm_episodes_per_min",
+            "False alarm episodes/min",
+            "#9c755f",
+            target_false_alarm_episodes_per_min,
+            f"Objetivo ({target_false_alarm_episodes_per_min:.2f})",
+        ),
+        (
+            "false_alarms_per_min",
+            "False alarms/min (chunks)",
+            "#ff7f0e",
+            None,
+            None,
+        ),
+    ]
+
+    for metric_key, ylabel, color, target_y, target_label in plot_specs:
+        save_single_metric_plot(
+            threshold_table["threshold"],
+            threshold_table[metric_key],
+            title=f"{stage_name.capitalize()} | {ylabel} frente al umbral",
+            xlabel="Umbral",
+            ylabel=ylabel,
+            save_path=os.path.join(stage_dir, f"threshold_{metric_key}.png"),
+            show=show,
+            color=color,
+            selected_x=selected_threshold,
+            selected_label=f"Umbral aplicado ({selected_threshold:.2f})",
+            target_y=target_y,
+            target_label=target_label,
+        )
 
 
 def print_metrics_block(title, metrics):
@@ -2388,8 +3020,17 @@ def print_metrics_block(title, metrics):
     print(f"\n{title}")
     print(
         "Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | F2: {f2:.4f} | "
-        "AUC-PR: {auc_pr:.4f} | Falsas alarmas/min: {false_alarms_per_min:.2f}".format(**metrics)
+        "AUC-PR: {auc_pr:.4f} | Falsas alarmas chunk/min: {false_alarms_per_min:.2f}".format(
+            **metrics
+        )
     )
+    if "event_recall" in metrics:
+        print(
+            "Event recall: {event_recall:.4f} | Macro event coverage: {macro_event_coverage:.4f} | "
+            "False alarm episodes/min: {false_alarm_episodes_per_min:.2f} | "
+            "Eventos detectados: {detected_positive_event_count}/{total_positive_event_count} | "
+            "Episodios falsos: {false_alarm_episode_count}".format(**metrics)
+        )
     print(
         "Matriz de confusion [[TN, FP], [FN, TP]] = "
         f"{metrics['confusion_matrix']}"
@@ -2405,7 +3046,13 @@ def build_metrics_report_block(title, metrics):
         title,
         (
             "Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | F2: {f2:.4f} | "
-            "AUC-PR: {auc_pr:.4f} | Falsas alarmas/min: {false_alarms_per_min:.2f}"
+            "AUC-PR: {auc_pr:.4f} | Falsas alarmas chunk/min: {false_alarms_per_min:.2f}"
+        ).format(**metrics),
+        (
+            "Event recall: {event_recall:.4f} | Macro event coverage: {macro_event_coverage:.4f} | "
+            "False alarm episodes/min: {false_alarm_episodes_per_min:.2f} | "
+            "Eventos detectados: {detected_positive_event_count}/{total_positive_event_count} | "
+            "Episodios falsos: {false_alarm_episode_count}"
         ).format(**metrics),
         "Matriz de confusion [[TN, FP], [FN, TP]]:",
         str(np.array(metrics["confusion_matrix"])),
@@ -2418,6 +3065,7 @@ if __name__ == "__main__":
     # 1. Cargar metadata y construir los splits sin leakage.
     # -----------------------------------------------------------------------
     os.makedirs(RUN_OUTPUT_DIR, exist_ok=True)
+    prepare_plot_output_dirs()
 
     print("Cargando metadata...")
     if RUNTIME_CONFIG_PATH is not None:
@@ -2524,6 +3172,7 @@ if __name__ == "__main__":
             ratio=train_selection_summary["background_chunk_ratio_after"],
         )
     )
+    print_runtime_cluster_context()
     print_parallelism_configuration()
     print("Distribucion de clases en train (split completo antes de curacion):")
     print(train_split_df["label"].value_counts())
@@ -2616,52 +3265,147 @@ if __name__ == "__main__":
     model.save(MODEL_PATH)
     print(f"\nEntrenamiento finalizado. Modelo guardado en: {MODEL_PATH}")
 
-    if SHOW_TRAINING_PLOTS:
-        plot_training_history(history)
+    if SAVE_TRAINING_PLOTS or SHOW_TRAINING_PLOTS:
+        save_training_history_plots(
+            history,
+            show=SHOW_TRAINING_PLOTS,
+        )
 
     # -----------------------------------------------------------------------
     # 5. Evaluar la salida probabilistica por chunk en validacion y test.
     # -----------------------------------------------------------------------
     val_metrics = None
     test_metrics = None
+    threshold_calibration_info = None
+    selected_false_alarm_episode_limit = TARGET_FALSE_ALARM_EPISODES_PER_MIN
 
     print("\nEvaluando la salida probabilistica por chunk sobre validacion...")
-    val_y_true, val_y_scores = collect_chunk_predictions(model, val_df, DATASET_DIR)
+    val_y_true, val_y_scores, val_audio_prediction_records = collect_chunk_predictions(
+        model,
+        val_df,
+        DATASET_DIR,
+    )
     if USE_THRESHOLD_ANALYSIS:
-        best_threshold, threshold_table = select_best_threshold(
+        (
+            best_threshold,
+            threshold_table,
+            selected_false_alarm_episode_limit,
+            threshold_calibration_info,
+        ) = select_best_threshold(
             val_y_true,
             val_y_scores,
-            target_false_alarms_per_min=TARGET_FALSE_ALARMS_PER_MIN,
+            audio_prediction_records=val_audio_prediction_records,
+            target_false_alarm_episodes_per_min=TARGET_FALSE_ALARM_EPISODES_PER_MIN,
+            auto_calibrate_limit=AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT,
+            auto_false_alarm_episode_limit_candidates=AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES,
+            auto_event_recall_retention=AUTO_EVENT_RECALL_RETENTION,
         )
 
-        val_predictions = (val_y_scores >= best_threshold).astype(np.int32)
-        val_metrics = compute_metrics(val_y_true, val_predictions, val_y_scores)
+        val_metrics = compute_decision_metrics(
+            val_y_true,
+            val_y_scores,
+            threshold=best_threshold,
+            audio_prediction_records=val_audio_prediction_records,
+        )
 
         print(
             f"Umbral de referencia por chunk seleccionado para analisis auxiliar: {best_threshold:.2f}"
         )
+        print(
+            "Limite de episodios falsos/min usado para seleccionar el umbral: "
+            f"{selected_false_alarm_episode_limit:.2f}"
+        )
+        if AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT and threshold_calibration_info is not None:
+            print(
+                "Calibracion automatica del limite -> "
+                f"requested={threshold_calibration_info['requested_limit']:.2f} | "
+                f"selected={threshold_calibration_info['selected_limit']:.2f} | "
+                f"max_event_recall={threshold_calibration_info['max_event_recall']:.4f} | "
+                "min_required_event_recall="
+                f"{threshold_calibration_info['min_required_event_recall']:.4f} | "
+                f"reason={threshold_calibration_info['selection_reason']}"
+            )
+            candidate_summaries = threshold_calibration_info.get("candidate_summaries") or []
+            if candidate_summaries:
+                calibration_df = pd.DataFrame(candidate_summaries)
+                print("\nResumen de calibracion automatica del limite:")
+                print(
+                    calibration_df[
+                        [
+                            "candidate_limit",
+                            "constraint_satisfied",
+                            "meets_event_recall_retention",
+                            "selected_threshold",
+                            "selected_event_recall",
+                            "selected_macro_event_coverage",
+                            "selected_false_alarm_episodes_per_min",
+                            "selected_f2",
+                        ]
+                    ].to_string(index=False)
+                )
         print_metrics_block("Validacion por chunk", val_metrics)
         print(
             "La salida principal del sistema debe interpretarse como probabilidad por chunk. "
             "Cualquier logica binaria o de interfaz debe implementarse de forma causal fuera de este script."
         )
+        if SAVE_TRAINING_PLOTS or SHOW_TRAINING_PLOTS:
+            save_threshold_metric_plots(
+                threshold_table,
+                stage_name="validation",
+                selected_threshold=best_threshold,
+                target_false_alarm_episodes_per_min=selected_false_alarm_episode_limit,
+                show=SHOW_TRAINING_PLOTS,
+            )
     else:
         best_threshold = 0.5
         threshold_table = None
         print("Analisis de umbral desactivado. La salida del modelo se tratara solo como probabilidad por chunk.")
 
     print("\nEvaluando el modelo con datos desconocidos (Test Set) por chunk...")
-    test_y_true, test_y_scores = collect_chunk_predictions(model, test_df, DATASET_DIR)
+    test_y_true, test_y_scores, test_audio_prediction_records = collect_chunk_predictions(
+        model,
+        test_df,
+        DATASET_DIR,
+    )
     if USE_THRESHOLD_ANALYSIS:
-        test_predictions = (test_y_scores >= best_threshold).astype(np.int32)
-        test_metrics = compute_metrics(test_y_true, test_predictions, test_y_scores)
+        test_threshold_table = build_threshold_table(
+            test_y_true,
+            test_y_scores,
+            audio_prediction_records=test_audio_prediction_records,
+        )
+        test_metrics = compute_decision_metrics(
+            test_y_true,
+            test_y_scores,
+            threshold=best_threshold,
+            audio_prediction_records=test_audio_prediction_records,
+        )
         print_metrics_block("Test por chunk", test_metrics)
 
         threshold_summary = threshold_table[
-            ["threshold", "precision", "recall", "f1", "f2", "auc_pr", "false_alarms_per_min"]
+            [
+                "threshold",
+                "event_recall",
+                "macro_event_coverage",
+                "precision",
+                "recall",
+                "f1",
+                "f2",
+                "auc_pr",
+                "false_alarm_episodes_per_min",
+                "false_alarms_per_min",
+            ]
         ]
         print("\nResumen de umbrales evaluados en validacion:")
         print(threshold_summary.to_string(index=False))
+
+        if SAVE_TRAINING_PLOTS or SHOW_TRAINING_PLOTS:
+            save_threshold_metric_plots(
+                test_threshold_table,
+                stage_name="test",
+                selected_threshold=best_threshold,
+                target_false_alarm_episodes_per_min=selected_false_alarm_episode_limit,
+                show=SHOW_TRAINING_PLOTS,
+            )
     else:
         print(
             "Analisis binario desactivado en test. "
@@ -2726,15 +3470,34 @@ if __name__ == "__main__":
             f"Balanced chunk batches: {USE_BALANCED_CHUNK_BATCHES}",
             f"Train chunk batch size: {TRAIN_CHUNK_BATCH_SIZE}",
             f"Effective class weights: {effective_use_class_weights}",
+            f"System logical CPU count: {SYSTEM_LOGICAL_CPU_COUNT}",
             f"Logical CPU count: {LOGICAL_CPU_COUNT}",
+            f"SLURM cpus per task: {SLURM_CPUS_PER_TASK}",
+            f"SLURM job id: {SLURM_JOB_ID}",
+            f"SLURM job nodelist: {SLURM_JOB_NODELIST}",
             f"TF intra_op threads: {TF_INTRA_OP_THREADS}",
             f"TF inter_op threads: {TF_INTER_OP_THREADS}",
             f"PyDataset workers: {PYDATASET_WORKERS}",
             f"PyDataset multiprocessing: {PYDATASET_USE_MULTIPROCESSING}",
             f"PyDataset max queue size: {PYDATASET_MAX_QUEUE_SIZE}",
+            "CUDA_VISIBLE_DEVICES: "
+            f"{json.dumps(CUDA_VISIBLE_DEVICE_LIST, ensure_ascii=True)}",
+            "TensorFlow visible GPUs: "
+            f"{json.dumps([device.name for device in TF_VISIBLE_GPU_DEVICES], ensure_ascii=True)}",
             "Resumen de curacion de train: "
             f"{json.dumps(train_selection_summary, ensure_ascii=True)}",
             f"Umbral de referencia: {best_threshold:.2f}",
+            "Target false alarm episodes/min (requested): "
+            f"{TARGET_FALSE_ALARM_EPISODES_PER_MIN}",
+            "Target false alarm episodes/min (selected): "
+            f"{selected_false_alarm_episode_limit}",
+            f"Minimum event hit duration (s): {MIN_EVENT_HIT_DURATION_S}",
+            f"Auto calibrate false alarm episode limit: {AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT}",
+            "Auto false alarm episode limit candidates: "
+            f"{AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES}",
+            f"Auto event recall retention: {AUTO_EVENT_RECALL_RETENTION}",
+            "Threshold calibration info: "
+            f"{json.dumps(threshold_calibration_info or {}, ensure_ascii=True)}",
             "",
             build_metrics_report_block("Validacion por chunk", val_metrics),
             "",
@@ -2756,6 +3519,15 @@ if __name__ == "__main__":
                     "model_path": MODEL_PATH,
                     "recommended_chunk_threshold": best_threshold,
                     "target_false_alarms_per_min": TARGET_FALSE_ALARMS_PER_MIN,
+                    "target_false_alarm_episodes_per_min": TARGET_FALSE_ALARM_EPISODES_PER_MIN,
+                    "selected_false_alarm_episode_limit": selected_false_alarm_episode_limit,
+                    "min_event_hit_duration_s": MIN_EVENT_HIT_DURATION_S,
+                    "auto_calibrate_false_alarm_episode_limit": AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT,
+                    "auto_false_alarm_episode_limit_candidates": list(
+                        AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES
+                    ),
+                    "auto_event_recall_retention": AUTO_EVENT_RECALL_RETENTION,
+                    "sample_rate": SAMPLE_RATE,
                     "chunk_length_s": CHUNK_LENGTH_S,
                     "overlap_s": OVERLAP_S,
                     "decision_step_s": CHUNK_STEP_S,
@@ -2818,17 +3590,32 @@ if __name__ == "__main__":
                         TRAIN_BACKGROUND_REDUCED_BUCKETS
                     ),
                     "train_selection_summary": train_selection_summary,
+                    "system_logical_cpu_count": SYSTEM_LOGICAL_CPU_COUNT,
                     "logical_cpu_count": LOGICAL_CPU_COUNT,
+                    "slurm_cpus_per_task": SLURM_CPUS_PER_TASK,
+                    "slurm_job_id": SLURM_JOB_ID,
+                    "slurm_job_nodelist": SLURM_JOB_NODELIST,
                     "tf_intra_op_threads": TF_INTRA_OP_THREADS,
                     "tf_inter_op_threads": TF_INTER_OP_THREADS,
                     "pydataset_workers": PYDATASET_WORKERS,
                     "pydataset_use_multiprocessing": PYDATASET_USE_MULTIPROCESSING,
                     "pydataset_max_queue_size": PYDATASET_MAX_QUEUE_SIZE,
+                    "cuda_visible_devices": CUDA_VISIBLE_DEVICE_LIST,
+                    "tensorflow_visible_gpu_names": [
+                        device.name for device in TF_VISIBLE_GPU_DEVICES
+                    ],
                     "validation_metrics": val_metrics,
                     "test_metrics": test_metrics,
-                    "threshold_selection_metric": "f2",
+                    "threshold_calibration_info": threshold_calibration_info,
+                    "diagnostic_plot_root_dir": PLOTS_ROOT_DIR,
+                    "diagnostic_plot_stage_dirs": dict(PLOT_STAGE_DIRS),
+                    "threshold_selection_metric": (
+                        "event_recall_with_auto_calibrated_false_alarm_episode_limit_then_macro_event_coverage"
+                    ),
                     "notes": (
                         "La CNN produce una probabilidad por chunk. "
+                        "El umbral auxiliar se selecciona priorizando event recall, "
+                        "episodios de falsa alarma por minuto y cobertura media por evento. "
                         "Las decisiones binarias o el suavizado temporal deben implementarse "
                         "de forma causal en el sistema de produccion."
                     ),
