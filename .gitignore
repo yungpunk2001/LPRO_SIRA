@@ -1,5 +1,6 @@
 *
 !.gitignore
+!.gitattributes
 !DataSet Camilo y Daniela/
 DataSet Camilo y Daniela/*
 !DataSet Camilo y Daniela/entrenar_modelo_margin_3.py
@@ -28,14 +29,7 @@ Integración Daniel+Daniela/*
 !Integración Daniel+Daniela/API-REST_comunicacion/
 !Integración Daniel+Daniela/API-REST_comunicacion/**
 !Integración Daniel+Daniela/Modelos/
-Integración Daniel+Daniela/Modelos/*
-!Integración Daniel+Daniela/Modelos/README.md
-!Integración Daniel+Daniela/Modelos/CNN/
-Integración Daniel+Daniela/Modelos/CNN/*
-!Integración Daniel+Daniela/Modelos/CNN/.gitkeep
-!Integración Daniel+Daniela/Modelos/Tradicionales/
-Integración Daniel+Daniela/Modelos/Tradicionales/*
-!Integración Daniel+Daniela/Modelos/Tradicionales/.gitkeep
+!Integración Daniel+Daniela/Modelos/**
 !Integración Daniel+Daniela/DATA-acquisition/
 !Integración Daniel+Daniela/DATA-acquisition/**
 !Integración Daniel+Daniela/UI-SIRA/

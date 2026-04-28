@@ -1,0 +1,632 @@
+{
+  "bundle_path": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/clasificador_tradicional_bundle.joblib",
+  "run_output_dir": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off",
+  "winner_name": "Random Forest",
+  "recommended_chunk_threshold": 0.550000011920929,
+  "target_false_alarms_per_min": 1.0,
+  "target_false_alarm_episodes_per_min": 1.0,
+  "selected_false_alarm_episode_limit": 0.5,
+  "min_event_hit_duration_s": 1.0,
+  "auto_calibrate_false_alarm_episode_limit": true,
+  "auto_false_alarm_episode_limit_candidates": [
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    10.0
+  ],
+  "auto_event_recall_retention": 0.95,
+  "chunk_length_s": 0.5,
+  "use_overlap": false,
+  "configured_overlap_s": 0.0,
+  "overlap_s": 0.0,
+  "decision_step_s": 0.5,
+  "sample_rate": 16000,
+  "split_manifest_path": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/dataset/metadata/split_manifest_clasif_trad_v3_573778887c12.csv",
+  "split_manifest_info_path": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/dataset/metadata/split_manifest_clasif_trad_v3_573778887c12_info.json",
+  "split_manifest_version": 3,
+  "split_manifest_reused": true,
+  "split_train_fraction": 0.7,
+  "split_validation_fraction": 0.15,
+  "split_test_fraction": 0.15,
+  "split_stratify_columns": [
+    "label",
+    "domain"
+  ],
+  "split_weight_column": "num_chunks",
+  "split_row_cost_weight": 0.15,
+  "labels": [
+    "background",
+    "siren"
+  ],
+  "positive_label": "siren",
+  "use_data_augmentation": true,
+  "use_pitch_shift_augmentation": false,
+  "augmentation_apply_prob": 0.5,
+  "augmentation_extra_copies": 1,
+  "use_spectral_eq_augmentation": false,
+  "eq_augmentation_probability": 0.2,
+  "eq_effective_conditional_probability": 0.4,
+  "eq_one_filter_probability": 0.7,
+  "eq_shelf_gain_db_max": 3.0,
+  "eq_bell_gain_db_max_siren_band": 2.0,
+  "eq_total_gain_db_limit": 4.0,
+  "eq_low_shelf_cutoff_hz_range": [
+    150.0,
+    500.0
+  ],
+  "eq_bell_center_hz_range": [
+    700.0,
+    2200.0
+  ],
+  "eq_high_shelf_cutoff_hz_range": [
+    2500.0,
+    6000.0
+  ],
+  "eq_bell_bandwidth_octaves_range": [
+    1.0,
+    1.8
+  ],
+  "eq_shelf_sharpness_range": [
+    2.0,
+    3.0
+  ],
+  "system_logical_cpu_count": 112,
+  "logical_cpu_count": 16,
+  "slurm_cpus_per_task": 16,
+  "slurm_job_id": "307",
+  "slurm_job_nodelist": "hpcattcg01",
+  "sklearn_n_jobs": 16,
+  "apply_train_background_subsampling": true,
+  "train_background_to_siren_chunk_ratio": 1.0,
+  "train_background_min_groups_per_bucket": 1,
+  "train_background_default_bucket_weight": 1.0,
+  "train_background_hard_negative_weight": 2.0,
+  "train_background_reduced_bucket_weight": 0.35,
+  "train_background_hard_negative_buckets": [
+    "UrbanSound8K_Clasificado/car_horn",
+    "UrbanSound8K_Clasificado/children_playing",
+    "UrbanSound8K_Clasificado/drilling",
+    "UrbanSound8K_Clasificado/jackhammer",
+    "UrbanSound8K_Clasificado/street_music"
+  ],
+  "train_background_reduced_buckets": [
+    "UrbanSound8K_Clasificado/air_conditioner",
+    "UrbanSound8K_Clasificado/dog_bark",
+    "UrbanSound8K_Clasificado/gun_shot"
+  ],
+  "train_selection_summary": {
+    "train_split_audio_count": 9233,
+    "train_selected_audio_count": 4897,
+    "train_split_chunk_count": 82981,
+    "train_selected_chunk_count": 44792,
+    "siren_audio_count": 2377,
+    "siren_chunk_count": 22387,
+    "background_audio_count_before": 6856,
+    "background_audio_count_after": 2520,
+    "background_chunk_count_before": 60594,
+    "background_chunk_count_after": 22405,
+    "background_bucket_count_before": 17,
+    "background_bucket_count_after": 17,
+    "background_chunk_ratio_after": 1.0008040380578014,
+    "background_chunks_by_bucket_before": {
+      "Large-Scale Audio Dataset for Emergency Vehicle Sirens and Road Noises": 11008,
+      "UrbanSound8K_Clasificado/street_music": 6760,
+      "UrbanSound8K_Clasificado/children_playing": 6658,
+      "UrbanSound8K_Clasificado/dog_bark": 5634,
+      "UrbanSound8K_Clasificado/drilling": 5362,
+      "UrbanSound8K_Clasificado/jackhammer": 5319,
+      "UrbanSound8K_Clasificado/engine_idling": 4466,
+      "A3S-Rec_CANTARINI": 3840,
+      "esc50": 1960,
+      "sireNNet": 1770,
+      "UrbanSound8K_Clasificado/air_conditioner": 1652,
+      "UrbanSound8K_Clasificado/car_horn": 1537,
+      "audioset": 1458,
+      "pixabay": 1000,
+      "UrbanSound8K_Clasificado/gun_shot": 909,
+      "DatasetCreatedWithAudioLDM-main": 835,
+      "iPhone Alarms": 426
+    },
+    "background_chunks_by_bucket_after": {
+      "UrbanSound8K_Clasificado/street_music": 3760,
+      "UrbanSound8K_Clasificado/children_playing": 3740,
+      "UrbanSound8K_Clasificado/drilling": 3081,
+      "Large-Scale Audio Dataset for Emergency Vehicle Sirens and Road Noises": 3047,
+      "UrbanSound8K_Clasificado/jackhammer": 2949,
+      "A3S-Rec_CANTARINI": 1920,
+      "UrbanSound8K_Clasificado/engine_idling": 1256,
+      "UrbanSound8K_Clasificado/car_horn": 856,
+      "UrbanSound8K_Clasificado/dog_bark": 556,
+      "esc50": 550,
+      "sireNNet": 492,
+      "audioset": 179,
+      "pixabay": 8,
+      "DatasetCreatedWithAudioLDM-main": 5,
+      "UrbanSound8K_Clasificado/air_conditioner": 4,
+      "UrbanSound8K_Clasificado/gun_shot": 1,
+      "iPhone Alarms": 1
+    }
+  },
+  "saved_models": {
+    "Random Forest": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/modelo_sirenas_random_forest.joblib",
+    "SVM": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/modelo_sirenas_svm.joblib",
+    "KNN": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/modelo_sirenas_knn.joblib"
+  },
+  "saved_bundles": {
+    "Random Forest": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/clasificador_tradicional_random_forest_bundle.joblib",
+    "SVM": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/clasificador_tradicional_svm_bundle.joblib",
+    "KNN": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/clasificador_tradicional_knn_bundle.joblib"
+  },
+  "runtime_config_path": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/configs/exp_012.json",
+  "runtime_config_overrides": {
+    "RANDOM_SEED": 42,
+    "SAVE_EXPERIMENT_REPORT": true,
+    "SAVE_POSTPROCESSING_CONFIG": true,
+    "SHOW_RF_PLOT": false,
+    "TARGET_FALSE_ALARMS_PER_MIN": 1.0,
+    "AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT": true,
+    "AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES": [
+      0.5,
+      1.0,
+      2.0,
+      3.0,
+      5.0,
+      10.0
+    ],
+    "AUTO_EVENT_RECALL_RETENTION": 0.95,
+    "CHUNK_LENGTH_S": 0.5,
+    "USE_OVERLAP": false,
+    "OVERLAP_S": 0.0,
+    "USE_SPECTRAL_EQ_AUGMENTATION": false,
+    "EQ_AUGMENTATION_PROB": 0.2,
+    "EXPERIMENT_LABEL": "augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off",
+    "EXPERIMENT_TIER": "refine_r02",
+    "BASE_EXPERIMENT_ID": "augmentacion_sin_pitch",
+    "BASE_EXPERIMENT_LABEL": "augmentacion_sin_pitch",
+    "PARENT_EXPERIMENT_ID": "exp_004",
+    "PARENT_EXPERIMENT_LABEL": "augmentacion_sin_pitch",
+    "PARENT_SWEEP_ROUND": 1,
+    "EXPERIMENT_NOTES": "Refinamiento automatico desde augmentacion_sin_pitch (ronda 1). Desactiva la EQ para aislar su efecto dentro de la augmentacion.",
+    "USE_CLASS_WEIGHTS": false,
+    "USE_DATA_AUGMENTATION": true,
+    "TARGET_FALSE_ALARM_EPISODES_PER_MIN": 1.0,
+    "RF_N_ESTIMATORS": 200,
+    "SVM_C": 1.0,
+    "SVM_GAMMA": "scale",
+    "KNN_NEIGHBORS": 5,
+    "USE_PITCH_SHIFT_AUGMENTATION": false,
+    "AUGMENTATION_APPLY_PROB": 0.5,
+    "AUGMENTATION_EXTRA_COPIES": 1,
+    "RUN_OUTPUT_DIR": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off",
+    "RUN_NAME_PREFIX": "exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off"
+  },
+  "validation_metrics": {
+    "precision": 0.9450765864332604,
+    "recall": 0.828505658929599,
+    "f1": 0.8829602371460697,
+    "f2": 0.8494610966879081,
+    "auc_pr": 0.9309455629193547,
+    "accuracy": 0.9380243572395128,
+    "false_alarms_per_min": 2.2711506560096515,
+    "tn": 13011,
+    "fp": 251,
+    "fn": 894,
+    "tp": 4319,
+    "confusion_matrix": [
+      [
+        13011,
+        251
+      ],
+      [
+        894,
+        4319
+      ]
+    ],
+    "event_recall": 0.977924944812362,
+    "macro_event_coverage": 0.9419811695168092,
+    "detected_positive_event_count": 443,
+    "total_positive_event_count": 453,
+    "false_alarm_episode_count": 54,
+    "background_duration_min": 110.51666666666667,
+    "false_alarm_episodes_per_min": 0.4886140853566581,
+    "min_event_hit_duration_s": 1.0
+  },
+  "validation_metrics_refit": {
+    "precision": 1.0,
+    "recall": 0.9996163437559946,
+    "f1": 0.9998081350729087,
+    "f2": 0.9996930514522503,
+    "auc_pr": 0.9999759913014001,
+    "accuracy": 0.9998917456021651,
+    "false_alarms_per_min": 0.0,
+    "tn": 13262,
+    "fp": 0,
+    "fn": 2,
+    "tp": 5211,
+    "confusion_matrix": [
+      [
+        13262,
+        0
+      ],
+      [
+        2,
+        5211
+      ]
+    ],
+    "event_recall": 0.9977924944812362,
+    "macro_event_coverage": 0.9995584988962473,
+    "detected_positive_event_count": 452,
+    "total_positive_event_count": 453,
+    "false_alarm_episode_count": 0,
+    "background_duration_min": 110.51666666666667,
+    "false_alarm_episodes_per_min": 0.0,
+    "min_event_hit_duration_s": 1.0
+  },
+  "validation_metrics_refit_is_seen_data": true,
+  "selection_threshold_info": {
+    "threshold": 0.550000011920929,
+    "precision": 0.9450765864332604,
+    "recall": 0.828505658929599,
+    "f1": 0.8829602371460697,
+    "f2": 0.8494610966879081,
+    "auc_pr": 0.9309455629193547,
+    "accuracy": 0.9380243572395128,
+    "false_alarms_per_min": 2.2711506560096515,
+    "tn": 13011,
+    "fp": 251,
+    "fn": 894,
+    "tp": 4319,
+    "confusion_matrix": [
+      [
+        13011,
+        251
+      ],
+      [
+        894,
+        4319
+      ]
+    ],
+    "event_recall": 0.977924944812362,
+    "macro_event_coverage": 0.9419811695168092,
+    "detected_positive_event_count": 443,
+    "total_positive_event_count": 453,
+    "false_alarm_episode_count": 54,
+    "background_duration_min": 110.51666666666667,
+    "false_alarm_episodes_per_min": 0.4886140853566581,
+    "min_event_hit_duration_s": 1.0,
+    "constraint_satisfied": true,
+    "target_false_alarms_per_min": 1.0,
+    "target_false_alarm_episodes_per_min": 1.0,
+    "selected_false_alarm_episode_limit": 0.5,
+    "threshold_calibration_info": {
+      "requested_limit": 1.0,
+      "selected_limit": 0.5,
+      "event_recall_retention": 0.95,
+      "max_event_recall": 0.9977924944812362,
+      "min_required_event_recall": 0.9479028697571743,
+      "selection_reason": "smallest_feasible_limit_retaining_target_event_recall",
+      "candidate_summaries": [
+        {
+          "candidate_limit": 0.5,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.550000011920929,
+          "selected_event_recall": 0.977924944812362,
+          "selected_macro_event_coverage": 0.9419811695168092,
+          "selected_f2": 0.8494610966879081,
+          "selected_recall": 0.828505658929599,
+          "selected_false_alarm_episodes_per_min": 0.4886140853566581,
+          "selected_false_alarms_per_min": 2.2711506560096515,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 1.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.5,
+          "selected_event_recall": 0.977924944812362,
+          "selected_macro_event_coverage": 0.9514460555959748,
+          "selected_f2": 0.8557872539831303,
+          "selected_recall": 0.8407826587377709,
+          "selected_false_alarm_episodes_per_min": 0.7057759010707284,
+          "selected_false_alarms_per_min": 3.3750565525561758,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 2.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.3499999940395355,
+          "selected_event_recall": 0.9933774834437086,
+          "selected_macro_event_coverage": 0.9705452928599487,
+          "selected_f2": 0.855607917059378,
+          "selected_recall": 0.8707078457701899,
+          "selected_false_alarm_episodes_per_min": 1.9454079324385463,
+          "selected_false_alarms_per_min": 10.26089579248982,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 3.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.25,
+          "selected_event_recall": 0.9955849889624724,
+          "selected_macro_event_coverage": 0.9784517897291783,
+          "selected_f2": 0.8433558764394078,
+          "selected_recall": 0.8850949549203914,
+          "selected_false_alarm_episodes_per_min": 2.9678781480922938,
+          "selected_false_alarms_per_min": 17.09244457849495,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 5.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.20000000298023224,
+          "selected_event_recall": 0.9955849889624724,
+          "selected_macro_event_coverage": 0.981581559692893,
+          "selected_f2": 0.8314618757352155,
+          "selected_recall": 0.8948781891425283,
+          "selected_false_alarm_episodes_per_min": 3.9632031367817824,
+          "selected_false_alarms_per_min": 22.946765193786756,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 10.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.10000000149011612,
+          "selected_event_recall": 0.9977924944812362,
+          "selected_macro_event_coverage": 0.9936968081413914,
+          "selected_f2": 0.7966473694255359,
+          "selected_recall": 0.9608670631114521,
+          "selected_false_alarm_episodes_per_min": 8.985070125169658,
+          "selected_false_alarms_per_min": 50.46297692655708,
+          "meets_event_recall_retention": true
+        }
+      ]
+    }
+  },
+  "final_threshold_info": {
+    "threshold": 0.550000011920929,
+    "precision": 0.9450765864332604,
+    "recall": 0.828505658929599,
+    "f1": 0.8829602371460697,
+    "f2": 0.8494610966879081,
+    "auc_pr": 0.9309455629193547,
+    "accuracy": 0.9380243572395128,
+    "false_alarms_per_min": 2.2711506560096515,
+    "tn": 13011,
+    "fp": 251,
+    "fn": 894,
+    "tp": 4319,
+    "confusion_matrix": [
+      [
+        13011,
+        251
+      ],
+      [
+        894,
+        4319
+      ]
+    ],
+    "event_recall": 0.977924944812362,
+    "macro_event_coverage": 0.9419811695168092,
+    "detected_positive_event_count": 443,
+    "total_positive_event_count": 453,
+    "false_alarm_episode_count": 54,
+    "background_duration_min": 110.51666666666667,
+    "false_alarm_episodes_per_min": 0.4886140853566581,
+    "min_event_hit_duration_s": 1.0,
+    "constraint_satisfied": true,
+    "target_false_alarms_per_min": 1.0,
+    "target_false_alarm_episodes_per_min": 1.0,
+    "selected_false_alarm_episode_limit": 0.5,
+    "threshold_calibration_info": {
+      "requested_limit": 1.0,
+      "selected_limit": 0.5,
+      "event_recall_retention": 0.95,
+      "max_event_recall": 0.9977924944812362,
+      "min_required_event_recall": 0.9479028697571743,
+      "selection_reason": "smallest_feasible_limit_retaining_target_event_recall",
+      "candidate_summaries": [
+        {
+          "candidate_limit": 0.5,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.550000011920929,
+          "selected_event_recall": 0.977924944812362,
+          "selected_macro_event_coverage": 0.9419811695168092,
+          "selected_f2": 0.8494610966879081,
+          "selected_recall": 0.828505658929599,
+          "selected_false_alarm_episodes_per_min": 0.4886140853566581,
+          "selected_false_alarms_per_min": 2.2711506560096515,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 1.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.5,
+          "selected_event_recall": 0.977924944812362,
+          "selected_macro_event_coverage": 0.9514460555959748,
+          "selected_f2": 0.8557872539831303,
+          "selected_recall": 0.8407826587377709,
+          "selected_false_alarm_episodes_per_min": 0.7057759010707284,
+          "selected_false_alarms_per_min": 3.3750565525561758,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 2.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.3499999940395355,
+          "selected_event_recall": 0.9933774834437086,
+          "selected_macro_event_coverage": 0.9705452928599487,
+          "selected_f2": 0.855607917059378,
+          "selected_recall": 0.8707078457701899,
+          "selected_false_alarm_episodes_per_min": 1.9454079324385463,
+          "selected_false_alarms_per_min": 10.26089579248982,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 3.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.25,
+          "selected_event_recall": 0.9955849889624724,
+          "selected_macro_event_coverage": 0.9784517897291783,
+          "selected_f2": 0.8433558764394078,
+          "selected_recall": 0.8850949549203914,
+          "selected_false_alarm_episodes_per_min": 2.9678781480922938,
+          "selected_false_alarms_per_min": 17.09244457849495,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 5.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.20000000298023224,
+          "selected_event_recall": 0.9955849889624724,
+          "selected_macro_event_coverage": 0.981581559692893,
+          "selected_f2": 0.8314618757352155,
+          "selected_recall": 0.8948781891425283,
+          "selected_false_alarm_episodes_per_min": 3.9632031367817824,
+          "selected_false_alarms_per_min": 22.946765193786756,
+          "meets_event_recall_retention": true
+        },
+        {
+          "candidate_limit": 10.0,
+          "constraint_satisfied": true,
+          "selected_threshold": 0.10000000149011612,
+          "selected_event_recall": 0.9977924944812362,
+          "selected_macro_event_coverage": 0.9936968081413914,
+          "selected_f2": 0.7966473694255359,
+          "selected_recall": 0.9608670631114521,
+          "selected_false_alarm_episodes_per_min": 8.985070125169658,
+          "selected_false_alarms_per_min": 50.46297692655708,
+          "meets_event_recall_retention": true
+        }
+      ]
+    },
+    "threshold_frozen_after_selection": true,
+    "threshold_source_split": "validation_clean_pre_refit",
+    "threshold_calibration_stage": "validation_before_train_val_refit_frozen_for_final_model"
+  },
+  "test_metrics": {
+    "precision": 0.8477443609022557,
+    "recall": 0.9407592824363789,
+    "f1": 0.8918331026300178,
+    "f2": 0.9205584585238407,
+    "auc_pr": 0.9693624788150933,
+    "accuracy": 0.939687965157947,
+    "false_alarms_per_min": 7.283626826526788,
+    "tn": 12535,
+    "fp": 810,
+    "fn": 284,
+    "tp": 4510,
+    "confusion_matrix": [
+      [
+        12535,
+        810
+      ],
+      [
+        284,
+        4510
+      ]
+    ],
+    "event_recall": 0.9802197802197802,
+    "macro_event_coverage": 0.9526796414818393,
+    "detected_positive_event_count": 446,
+    "total_positive_event_count": 455,
+    "false_alarm_episode_count": 99,
+    "background_duration_min": 111.20833333333333,
+    "false_alarm_episodes_per_min": 0.8902210565754964,
+    "min_event_hit_duration_s": 1.0
+  },
+  "threshold_calibration_info": {
+    "requested_limit": 1.0,
+    "selected_limit": 0.5,
+    "event_recall_retention": 0.95,
+    "max_event_recall": 0.9977924944812362,
+    "min_required_event_recall": 0.9479028697571743,
+    "selection_reason": "smallest_feasible_limit_retaining_target_event_recall",
+    "candidate_summaries": [
+      {
+        "candidate_limit": 0.5,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.550000011920929,
+        "selected_event_recall": 0.977924944812362,
+        "selected_macro_event_coverage": 0.9419811695168092,
+        "selected_f2": 0.8494610966879081,
+        "selected_recall": 0.828505658929599,
+        "selected_false_alarm_episodes_per_min": 0.4886140853566581,
+        "selected_false_alarms_per_min": 2.2711506560096515,
+        "meets_event_recall_retention": true
+      },
+      {
+        "candidate_limit": 1.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.5,
+        "selected_event_recall": 0.977924944812362,
+        "selected_macro_event_coverage": 0.9514460555959748,
+        "selected_f2": 0.8557872539831303,
+        "selected_recall": 0.8407826587377709,
+        "selected_false_alarm_episodes_per_min": 0.7057759010707284,
+        "selected_false_alarms_per_min": 3.3750565525561758,
+        "meets_event_recall_retention": true
+      },
+      {
+        "candidate_limit": 2.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.3499999940395355,
+        "selected_event_recall": 0.9933774834437086,
+        "selected_macro_event_coverage": 0.9705452928599487,
+        "selected_f2": 0.855607917059378,
+        "selected_recall": 0.8707078457701899,
+        "selected_false_alarm_episodes_per_min": 1.9454079324385463,
+        "selected_false_alarms_per_min": 10.26089579248982,
+        "meets_event_recall_retention": true
+      },
+      {
+        "candidate_limit": 3.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.25,
+        "selected_event_recall": 0.9955849889624724,
+        "selected_macro_event_coverage": 0.9784517897291783,
+        "selected_f2": 0.8433558764394078,
+        "selected_recall": 0.8850949549203914,
+        "selected_false_alarm_episodes_per_min": 2.9678781480922938,
+        "selected_false_alarms_per_min": 17.09244457849495,
+        "meets_event_recall_retention": true
+      },
+      {
+        "candidate_limit": 5.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.20000000298023224,
+        "selected_event_recall": 0.9955849889624724,
+        "selected_macro_event_coverage": 0.981581559692893,
+        "selected_f2": 0.8314618757352155,
+        "selected_recall": 0.8948781891425283,
+        "selected_false_alarm_episodes_per_min": 3.9632031367817824,
+        "selected_false_alarms_per_min": 22.946765193786756,
+        "meets_event_recall_retention": true
+      },
+      {
+        "candidate_limit": 10.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.10000000149011612,
+        "selected_event_recall": 0.9977924944812362,
+        "selected_macro_event_coverage": 0.9936968081413914,
+        "selected_f2": 0.7966473694255359,
+        "selected_recall": 0.9608670631114521,
+        "selected_false_alarm_episodes_per_min": 8.985070125169658,
+        "selected_false_alarms_per_min": 50.46297692655708,
+        "meets_event_recall_retention": true
+      }
+    ]
+  },
+  "selection_metric": "validation_event_recall_with_false_alarm_episode_constraint_then_macro_event_coverage",
+  "threshold_selection_metric": "event_recall_with_auto_calibrated_false_alarm_episode_limit_then_macro_event_coverage",
+  "threshold_calibration_stage": "validation_before_train_val_refit_frozen_for_final_model",
+  "diagnostic_plot_paths": {
+    "root_dir": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off_20260422_181051_624785",
+    "stage_dirs": {
+      "train": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off_20260422_181051_624785/train_exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off_20260422_181051_624785",
+      "validation": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off_20260422_181051_624785/validation_exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off_20260422_181051_624785",
+      "test": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Clasificadores Tradicionales/barrido_clasif_trad_iterativo_20260422_130720/ronda_02/artefactos/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off/exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off_20260422_181051_624785/test_exp_012_augmentacion_sin_pitch_r02_from_r01_exp_004_eq_off_20260422_181051_624785"
+    }
+  },
+  "notes": "El umbral final recomendado se fija con la validacion limpia previa al refit y se reutiliza sin recalibrar tras entrenar el modelo final con train+val. Las metricas `validation_metrics_refit` son solo diagnosticas sobre datos ya vistos."
+}

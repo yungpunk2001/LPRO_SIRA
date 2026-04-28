@@ -1,0 +1,376 @@
+{
+  "model_path": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Modelos Atlas/barrido_margin_3_iterativo_20260422_132035/ronda_01/artefactos/exp_002_exp002_0p5s_logmel_core_20260422_213717_527369.keras",
+  "recommended_chunk_threshold": 0.3499999940395355,
+  "target_false_alarms_per_min": 1.0,
+  "target_false_alarm_episodes_per_min": 1.0,
+  "selected_false_alarm_episode_limit": 3.0,
+  "min_event_hit_duration_s": 1.0,
+  "auto_calibrate_false_alarm_episode_limit": true,
+  "auto_false_alarm_episode_limit_candidates": [
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    10.0
+  ],
+  "auto_event_recall_retention": 0.95,
+  "sample_rate": 16000,
+  "chunk_length_s": 0.5,
+  "overlap_s": 0.0,
+  "decision_step_s": 0.5,
+  "spectral_frontend": "log_mel",
+  "feature_representation": "harmonic_full",
+  "spectrogram_normalization": "minmax",
+  "window": "hamming",
+  "hpss_margin": 3.0,
+  "n_fft": 1024,
+  "hop_length": 512,
+  "padded_chunk_samples": 8192,
+  "linear_freq_bins": 359,
+  "time_frames": 17,
+  "mel_bins": 128,
+  "split_manifest_path": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/dataset/metadata/split_manifest_margin_3_v3_0c963da8e08c.csv",
+  "split_manifest_info_path": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/dataset/metadata/split_manifest_margin_3_v3_0c963da8e08c_info.json",
+  "split_manifest_version": 3,
+  "split_train_fraction": 0.7,
+  "split_validation_fraction": 0.15,
+  "split_test_fraction": 0.15,
+  "split_stratify_columns": [
+    "label",
+    "domain"
+  ],
+  "split_weight_column": "num_chunks",
+  "split_row_cost_weight": 0.15,
+  "conv_filters": [
+    16,
+    32,
+    64
+  ],
+  "dense_units": 32,
+  "runtime_config_path": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Modelos Atlas/barrido_margin_3_iterativo_20260422_132035/ronda_01/configs/exp_002.json",
+  "runtime_config_overrides": {
+    "RANDOM_SEED": 42,
+    "SHOW_TRAINING_PLOTS": false,
+    "USE_THRESHOLD_ANALYSIS": true,
+    "SAVE_POSTPROCESSING_CONFIG": true,
+    "SAVE_CONFUSION_REPORT": false,
+    "USE_CLASS_WEIGHTS": true,
+    "TRAIN_CHUNK_BATCH_SIZE": 64,
+    "OVERLAP_S": 0.0,
+    "AUTO_CALIBRATE_FALSE_ALARM_EPISODE_LIMIT": true,
+    "AUTO_FALSE_ALARM_EPISODE_LIMIT_CANDIDATES": [
+      0.5,
+      1.0,
+      2.0,
+      3.0,
+      5.0,
+      10.0
+    ],
+    "AUTO_EVENT_RECALL_RETENTION": 0.95,
+    "EXPERIMENT_LABEL": "exp002_0p5s_logmel_core",
+    "EXPERIMENT_TIER": "core",
+    "BASE_EXPERIMENT_ID": "exp002",
+    "BASE_EXPERIMENT_LABEL": "solo_balanceo_chunks",
+    "COMPARISON_WINDOW_S": 0.5,
+    "COMPARISON_WINDOW_TAG": "0p5s",
+    "COMPARISON_FRONTEND": "log_mel",
+    "COMPARISON_FRONTEND_TAG": "logmel",
+    "EXPERIMENT_NOTES": "Seed exp002: harmonic_full con balanceo por chunks. Frontend log-mel; FEATURE_REPRESENTATION queda solo como trazabilidad. Parte de la matriz principal para comparar ventana y frontend.",
+    "FEATURE_REPRESENTATION": "harmonic_full",
+    "SPECTROGRAM_NORMALIZATION": "minmax",
+    "CONV_FILTERS": [
+      16,
+      32,
+      64
+    ],
+    "DENSE_UNITS": 32,
+    "USE_BALANCED_CHUNK_BATCHES": true,
+    "USE_DATA_AUGMENTATION": false,
+    "CHUNK_LENGTH_S": 0.5,
+    "TIME_FRAMES": 17,
+    "SPECTRAL_FRONTEND": "log_mel",
+    "MEL_BINS": 128,
+    "RUN_OUTPUT_DIR": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Modelos Atlas/barrido_margin_3_iterativo_20260422_132035/ronda_01/artefactos",
+    "RUN_NAME_PREFIX": "exp_002_exp002_0p5s_logmel_core"
+  },
+  "labels": [
+    "background",
+    "siren"
+  ],
+  "output_mode": "chunk_probability",
+  "use_class_weights": true,
+  "effective_use_class_weights": false,
+  "use_data_augmentation": false,
+  "augmentation_apply_probability": 0.5,
+  "use_spectral_eq_augmentation": true,
+  "eq_augmentation_probability": 0.2,
+  "eq_effective_conditional_probability": 0.4,
+  "eq_one_filter_probability": 0.7,
+  "eq_shelf_gain_db_max": 3.0,
+  "eq_bell_gain_db_max_siren_band": 2.0,
+  "eq_total_gain_db_limit": 4.0,
+  "eq_low_shelf_cutoff_hz_range": [
+    150.0,
+    500.0
+  ],
+  "eq_bell_center_hz_range": [
+    700.0,
+    2200.0
+  ],
+  "eq_high_shelf_cutoff_hz_range": [
+    2500.0,
+    6000.0
+  ],
+  "eq_bell_bandwidth_octaves_range": [
+    1.0,
+    1.8
+  ],
+  "eq_shelf_sharpness_range": [
+    2.0,
+    3.0
+  ],
+  "use_frequency_normalization": false,
+  "use_threshold_analysis": true,
+  "use_balanced_chunk_batches": true,
+  "train_chunk_batch_size": 64,
+  "apply_train_background_subsampling": true,
+  "train_background_to_siren_chunk_ratio": 1.0,
+  "train_background_min_groups_per_bucket": 1,
+  "train_background_default_bucket_weight": 1.0,
+  "train_background_hard_negative_weight": 2.0,
+  "train_background_reduced_bucket_weight": 0.35,
+  "train_background_hard_negative_buckets": [
+    "UrbanSound8K_Clasificado/car_horn",
+    "UrbanSound8K_Clasificado/children_playing",
+    "UrbanSound8K_Clasificado/drilling",
+    "UrbanSound8K_Clasificado/jackhammer",
+    "UrbanSound8K_Clasificado/street_music"
+  ],
+  "train_background_reduced_buckets": [
+    "UrbanSound8K_Clasificado/air_conditioner",
+    "UrbanSound8K_Clasificado/dog_bark",
+    "UrbanSound8K_Clasificado/gun_shot"
+  ],
+  "train_selection_summary": {
+    "train_split_audio_count": 9233,
+    "train_selected_audio_count": 4897,
+    "train_split_chunk_count": 82981,
+    "train_selected_chunk_count": 44792,
+    "siren_audio_count": 2377,
+    "siren_chunk_count": 22387,
+    "background_audio_count_before": 6856,
+    "background_audio_count_after": 2520,
+    "background_chunk_count_before": 60594,
+    "background_chunk_count_after": 22405,
+    "background_bucket_count_before": 17,
+    "background_bucket_count_after": 17,
+    "background_chunk_ratio_after": 1.0008040380578014,
+    "background_chunks_by_bucket_before": {
+      "Large-Scale Audio Dataset for Emergency Vehicle Sirens and Road Noises": 11008,
+      "UrbanSound8K_Clasificado/street_music": 6760,
+      "UrbanSound8K_Clasificado/children_playing": 6658,
+      "UrbanSound8K_Clasificado/dog_bark": 5634,
+      "UrbanSound8K_Clasificado/drilling": 5362,
+      "UrbanSound8K_Clasificado/jackhammer": 5319,
+      "UrbanSound8K_Clasificado/engine_idling": 4466,
+      "A3S-Rec_CANTARINI": 3840,
+      "esc50": 1960,
+      "sireNNet": 1770,
+      "UrbanSound8K_Clasificado/air_conditioner": 1652,
+      "UrbanSound8K_Clasificado/car_horn": 1537,
+      "audioset": 1458,
+      "pixabay": 1000,
+      "UrbanSound8K_Clasificado/gun_shot": 909,
+      "DatasetCreatedWithAudioLDM-main": 835,
+      "iPhone Alarms": 426
+    },
+    "background_chunks_by_bucket_after": {
+      "UrbanSound8K_Clasificado/street_music": 3760,
+      "UrbanSound8K_Clasificado/children_playing": 3740,
+      "UrbanSound8K_Clasificado/drilling": 3081,
+      "Large-Scale Audio Dataset for Emergency Vehicle Sirens and Road Noises": 3047,
+      "UrbanSound8K_Clasificado/jackhammer": 2949,
+      "A3S-Rec_CANTARINI": 1920,
+      "UrbanSound8K_Clasificado/engine_idling": 1256,
+      "UrbanSound8K_Clasificado/car_horn": 856,
+      "UrbanSound8K_Clasificado/dog_bark": 556,
+      "esc50": 550,
+      "sireNNet": 492,
+      "audioset": 179,
+      "pixabay": 8,
+      "DatasetCreatedWithAudioLDM-main": 5,
+      "UrbanSound8K_Clasificado/air_conditioner": 4,
+      "UrbanSound8K_Clasificado/gun_shot": 1,
+      "iPhone Alarms": 1
+    }
+  },
+  "system_logical_cpu_count": 112,
+  "logical_cpu_count": 4,
+  "slurm_cpus_per_task": 4,
+  "slurm_job_id": "308",
+  "slurm_job_nodelist": "hpcattcg01",
+  "tf_intra_op_threads": 3,
+  "tf_inter_op_threads": 1,
+  "pydataset_workers": 1,
+  "pydataset_use_multiprocessing": false,
+  "pydataset_max_queue_size": 10,
+  "cuda_visible_devices": [
+    "4"
+  ],
+  "tensorflow_visible_gpu_names": [
+    "/physical_device:GPU:0"
+  ],
+  "validation_metrics": {
+    "precision": 0.7314880112834978,
+    "recall": 0.7958948781891425,
+    "f1": 0.762333486449242,
+    "f2": 0.7821218519077062,
+    "auc_pr": 0.8842487344056407,
+    "false_alarms_per_min": 13.780726888855376,
+    "tn": 11739,
+    "fp": 1523,
+    "fn": 1064,
+    "tp": 4149,
+    "confusion_matrix": [
+      [
+        11739,
+        1523
+      ],
+      [
+        1064,
+        4149
+      ]
+    ],
+    "event_recall": 0.9536423841059603,
+    "macro_event_coverage": 0.8943252628710133,
+    "detected_positive_event_count": 432,
+    "total_positive_event_count": 453,
+    "false_alarm_episode_count": 296,
+    "background_duration_min": 110.51666666666667,
+    "false_alarm_episodes_per_min": 2.6783290604735335,
+    "min_event_hit_duration_s": 1.0
+  },
+  "test_metrics": {
+    "precision": 0.6498709971164062,
+    "recall": 0.8931998331247393,
+    "f1": 0.7523499956074848,
+    "f2": 0.8309722491752377,
+    "auc_pr": 0.8896441509716844,
+    "false_alarms_per_min": 20.74484825777445,
+    "tn": 11038,
+    "fp": 2307,
+    "fn": 512,
+    "tp": 4282,
+    "confusion_matrix": [
+      [
+        11038,
+        2307
+      ],
+      [
+        512,
+        4282
+      ]
+    ],
+    "event_recall": 0.945054945054945,
+    "macro_event_coverage": 0.8975614302344439,
+    "detected_positive_event_count": 430,
+    "total_positive_event_count": 455,
+    "false_alarm_episode_count": 385,
+    "background_duration_min": 111.20833333333333,
+    "false_alarm_episodes_per_min": 3.461970775571375,
+    "min_event_hit_duration_s": 1.0
+  },
+  "threshold_calibration_info": {
+    "requested_limit": 1.0,
+    "selected_limit": 3.0,
+    "event_recall_retention": 0.95,
+    "max_event_recall": 0.9845474613686535,
+    "min_required_event_recall": 0.9353200883002207,
+    "selection_reason": "smallest_feasible_limit_retaining_target_event_recall",
+    "candidate_summaries": [
+      {
+        "candidate_limit": 0.5,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.75,
+        "selected_event_recall": 0.8543046357615894,
+        "selected_macro_event_coverage": 0.7632350389327299,
+        "selected_f2": 0.7059827670297513,
+        "selected_recall": 0.6664108958373297,
+        "selected_false_alarm_episodes_per_min": 0.4433720404162268,
+        "selected_false_alarms_per_min": 2.515457698687981,
+        "meets_event_recall_retention": false
+      },
+      {
+        "candidate_limit": 1.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.699999988079071,
+        "selected_event_recall": 0.869757174392936,
+        "selected_macro_event_coverage": 0.7855926093262736,
+        "selected_f2": 0.7185737308622079,
+        "selected_recall": 0.6842509111835795,
+        "selected_false_alarm_episodes_per_min": 0.7781631729754185,
+        "selected_false_alarms_per_min": 3.6284120042225907,
+        "meets_event_recall_retention": false
+      },
+      {
+        "candidate_limit": 2.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.44999998807907104,
+        "selected_event_recall": 0.9337748344370861,
+        "selected_macro_event_coverage": 0.8673083907823831,
+        "selected_f2": 0.7626594511016621,
+        "selected_recall": 0.7569537694225974,
+        "selected_false_alarm_episodes_per_min": 1.86397225154577,
+        "selected_false_alarms_per_min": 9.699894435228472,
+        "meets_event_recall_retention": false
+      },
+      {
+        "candidate_limit": 3.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.3499999940395355,
+        "selected_event_recall": 0.9536423841059603,
+        "selected_macro_event_coverage": 0.8943252628710133,
+        "selected_f2": 0.7821218519077062,
+        "selected_recall": 0.7958948781891425,
+        "selected_false_alarm_episodes_per_min": 2.6783290604735335,
+        "selected_false_alarms_per_min": 13.780726888855376,
+        "meets_event_recall_retention": true
+      },
+      {
+        "candidate_limit": 5.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.25,
+        "selected_event_recall": 0.9713024282560706,
+        "selected_macro_event_coverage": 0.9235008445649564,
+        "selected_f2": 0.8038393405878312,
+        "selected_recall": 0.8530596585459428,
+        "selected_false_alarm_episodes_per_min": 4.117026089579249,
+        "selected_false_alarms_per_min": 21.372342029859748,
+        "meets_event_recall_retention": true
+      },
+      {
+        "candidate_limit": 10.0,
+        "constraint_satisfied": true,
+        "selected_threshold": 0.10000000149011612,
+        "selected_event_recall": 0.9845474613686535,
+        "selected_macro_event_coverage": 0.9677870475072884,
+        "selected_f2": 0.8055260018699423,
+        "selected_recall": 0.9585651256474199,
+        "selected_false_alarm_episodes_per_min": 8.053083999396772,
+        "selected_false_alarms_per_min": 46.7621776504298,
+        "meets_event_recall_retention": true
+      }
+    ],
+    "selected_threshold_constraint_satisfied": true,
+    "selected_threshold": 0.3499999940395355
+  },
+  "diagnostic_plot_root_dir": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Modelos Atlas/barrido_margin_3_iterativo_20260422_132035/ronda_01/artefactos/exp_002_exp002_0p5s_logmel_core_20260422_213717_527369",
+  "diagnostic_plot_stage_dirs": {
+    "train": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Modelos Atlas/barrido_margin_3_iterativo_20260422_132035/ronda_01/artefactos/exp_002_exp002_0p5s_logmel_core_20260422_213717_527369/train_exp_002_exp002_0p5s_logmel_core_20260422_213717_527369",
+    "validation": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Modelos Atlas/barrido_margin_3_iterativo_20260422_132035/ronda_01/artefactos/exp_002_exp002_0p5s_logmel_core_20260422_213717_527369/validation_exp_002_exp002_0p5s_logmel_core_20260422_213717_527369",
+    "test": "/home/lpro02/filesLPRO/Detecci\u00f3n Camilo y Daniela/Modelos Atlas/barrido_margin_3_iterativo_20260422_132035/ronda_01/artefactos/exp_002_exp002_0p5s_logmel_core_20260422_213717_527369/test_exp_002_exp002_0p5s_logmel_core_20260422_213717_527369"
+  },
+  "threshold_selection_metric": "event_recall_with_auto_calibrated_false_alarm_episode_limit_then_macro_event_coverage",
+  "notes": "La CNN produce una probabilidad por chunk. El umbral auxiliar se selecciona priorizando event recall, episodios de falsa alarma por minuto y cobertura media por evento. Las decisiones binarias o el suavizado temporal deben implementarse de forma causal en el sistema de produccion."
+}
