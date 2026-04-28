@@ -10,7 +10,7 @@ MODEL = {
 
     # Patrones de busqueda dentro de cada carpeta. Permiten subcarpetas.
     'cnn_pattern': '**/*.keras',
-    'traditional_pattern': '**/clasificador_tradicional_*_bundle.joblib',
+    'traditional_pattern': '**/*clasificador_tradicional_*_bundle.joblib',
 
     'api_url': 'http://192.168.1.138:8000',
 

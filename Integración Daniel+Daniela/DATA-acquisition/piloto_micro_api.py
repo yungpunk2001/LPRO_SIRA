@@ -17,8 +17,20 @@ from doa_music import doa_music
 
 
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = BASE_DIR.parent
 API_URL = ccnn.MODEL['api_url']
 SR = cdoa.AUDIO['rate']
+
+
+def project_relative_path(path_value: str | Path) -> str:
+    path = Path(path_value)
+    try:
+        return path.resolve().relative_to(PROJECT_DIR).as_posix()
+    except ValueError:
+        try:
+            return path.resolve().relative_to(BASE_DIR).as_posix()
+        except ValueError:
+            return path.as_posix()
 
 
 def resolve_configured_directory(config_key: str, default_value: str) -> Path:
@@ -37,9 +49,15 @@ def resolve_traditional_directory() -> Path:
 
 def discover_model_paths(model_dir: Path, pattern: str, model_kind: str) -> list[Path]:
     if not model_dir.exists():
-        raise FileNotFoundError(f"No existe la carpeta de modelos {model_kind}: {model_dir}")
+        raise FileNotFoundError(
+            f"No existe la carpeta de modelos {model_kind}: "
+            f"{project_relative_path(model_dir)}"
+        )
     if not model_dir.is_dir():
-        raise NotADirectoryError(f"La ruta de modelos {model_kind} no es una carpeta: {model_dir}")
+        raise NotADirectoryError(
+            f"La ruta de modelos {model_kind} no es una carpeta: "
+            f"{project_relative_path(model_dir)}"
+        )
     return sorted(path for path in model_dir.glob(pattern) if path.is_file())
 
 
@@ -104,8 +122,8 @@ def load_cnn_models(model_dir: Path) -> list[dict]:
             build_detection_state(
                 kind='cnn',
                 name=f"CNN:{model_path.relative_to(model_dir).with_suffix('').as_posix()}",
-                path=model_path_str,
-                config_path=config_path,
+                path=project_relative_path(model_path),
+                config_path=project_relative_path(config_path),
                 config=runtime_config,
                 model=model,
             )
@@ -116,7 +134,7 @@ def load_cnn_models(model_dir: Path) -> list[dict]:
 def load_traditional_models(model_dir: Path) -> list[dict]:
     pattern = ccnn.MODEL.get(
         'traditional_pattern',
-        '**/clasificador_tradicional_*_bundle.joblib',
+        '**/*clasificador_tradicional_*_bundle.joblib',
     )
     states = []
     for bundle_path in discover_model_paths(model_dir, pattern, 'tradicionales'):
@@ -128,8 +146,8 @@ def load_traditional_models(model_dir: Path) -> list[dict]:
             build_detection_state(
                 kind='traditional',
                 name=f"TRAD:{bundle_path.relative_to(model_dir).with_suffix('').as_posix()}",
-                path=bundle_path_str,
-                config_path=config_path,
+                path=project_relative_path(bundle_path),
+                config_path=project_relative_path(config_path),
                 config=runtime_config,
                 bundle=bundle,
             )
@@ -141,8 +159,8 @@ def validate_detection_states(detection_states: list[dict]) -> float:
     if not detection_states:
         raise FileNotFoundError(
             "No se encontro ningun modelo valido de deteccion.\n"
-            f"Carpeta CNN: {resolve_cnn_directory()}\n"
-            f"Carpeta tradicionales: {resolve_traditional_directory()}\n"
+            f"Carpeta CNN: {project_relative_path(resolve_cnn_directory())}\n"
+            f"Carpeta tradicionales: {project_relative_path(resolve_traditional_directory())}\n"
             "Coloca las CNN en Modelos/CNN y los bundles tradicionales en "
             "Modelos/Tradicionales, cada uno con su JSON de postprocesado."
         )

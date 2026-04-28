@@ -37,15 +37,31 @@ def path_name_from_json_value(value) -> str:
     return Path(str(value).replace("\\", "/")).name
 
 
+def normalized_bundle_filename(name: str) -> str:
+    marker = "clasificador_tradicional_"
+    if marker in name:
+        return f"{marker}{name.split(marker, 1)[1]}"
+    return name
+
+
+def bundle_filename_prefix(name: str) -> str:
+    marker = "clasificador_tradicional_"
+    if marker not in name:
+        return ""
+    return name.split(marker, 1)[0].rstrip("_- ")
+
+
 def json_references_bundle(payload: dict, bundle_path: Path) -> bool:
-    expected_name = bundle_path.name
+    expected_name = normalized_bundle_filename(bundle_path.name)
     saved_bundle_names = {
-        path_name_from_json_value(value)
+        normalized_bundle_filename(path_name_from_json_value(value))
         for value in (payload.get("saved_bundles") or {}).values()
     }
     default_bundle_path = payload.get("bundle_path")
     if default_bundle_path:
-        saved_bundle_names.add(path_name_from_json_value(default_bundle_path))
+        saved_bundle_names.add(
+            normalized_bundle_filename(path_name_from_json_value(default_bundle_path))
+        )
 
     if not saved_bundle_names:
         return True
@@ -72,6 +88,27 @@ def find_postprocessing_config(bundle_path: Path) -> tuple[dict, Path]:
             "Copia en la misma carpeta el *_postprocesado.json que genera "
             "entrenar_modelo_clasif_trad.py."
         )
+
+    bundle_prefix = bundle_filename_prefix(bundle_path.name)
+    if bundle_prefix:
+        prefixed_matches: list[tuple[dict, Path]] = []
+        for candidate in candidates:
+            if not candidate.name.startswith(bundle_prefix):
+                continue
+            payload = load_json(candidate)
+            if json_references_bundle(payload, bundle_path):
+                prefixed_matches.append((payload, candidate))
+
+        if len(prefixed_matches) == 1:
+            return prefixed_matches[0]
+        if len(prefixed_matches) > 1:
+            candidate_text = "\n".join(f"  - {path}" for _, path in prefixed_matches)
+            raise ValueError(
+                "Hay varios JSON de postprocesado con el mismo prefijo del bundle.\n"
+                f"Bundle: {bundle_path}\n"
+                f"Prefijo: {bundle_prefix}\n"
+                f"Candidatos:\n{candidate_text}"
+            )
 
     matching_candidates: list[tuple[dict, Path]] = []
     for candidate in candidates:

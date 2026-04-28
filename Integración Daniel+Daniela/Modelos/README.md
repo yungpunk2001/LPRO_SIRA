@@ -35,6 +35,10 @@ exp_001/
   exp_001_..._postprocesado.json
 ```
 
+Tambien se aceptan bundles con prefijo de experimento, por ejemplo
+`exp_012_clasificador_tradicional_random_forest_bundle.joblib`, siempre que el
+JSON de postprocesado tenga el mismo prefijo `exp_012`.
+
 El bundle contiene el modelo, el scaler, el label encoder y el umbral especifico
 del clasificador. El JSON aporta la configuracion temporal del entrenamiento.
 

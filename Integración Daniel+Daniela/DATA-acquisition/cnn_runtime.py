@@ -459,6 +459,7 @@ def load_model_for_inference(model_path: str) -> tf.keras.Model:
 def strip_quantization_config(config_node) -> None:
     if isinstance(config_node, dict):
         config_node.pop("quantization_config", None)
+        config_node.pop("compile_config", None)
         for value in config_node.values():
             strip_quantization_config(value)
     elif isinstance(config_node, list):
