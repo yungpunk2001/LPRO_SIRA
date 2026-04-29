@@ -409,6 +409,7 @@ def predict_traditional(bundle: dict, features: np.ndarray, threshold: float) ->
 
     if bundle.get("has_predict_proba"):
         probabilities = np.asarray(model.predict_proba(x_scaled))
+        # Usamos explicitamente p(siren), no max(predict_proba) ni p(background).
         probability = float(probabilities[0, bundle["positive_probability_index"]])
         return {
             "probability": probability,

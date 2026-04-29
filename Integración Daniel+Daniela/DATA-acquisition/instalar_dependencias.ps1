@@ -11,7 +11,7 @@ $python = ".\venv_sira\Scripts\python.exe"
 & $python -m pip install --upgrade pip
 
 Write-Host ">>> Descargando e instalando librerias necesarias..." -ForegroundColor Yellow
-& $python -m pip install numpy scipy librosa scikit-learn joblib tensorflow requests pyaudio
+& $python -m pip install numpy scipy librosa scikit-learn joblib tensorflow requests pyaudio matplotlib
 
 Write-Host ">>> INSTALACION COMPLETADA CON EXITO." -ForegroundColor Green
 Write-Host ">>> Para activar el entorno: .\venv_sira\Scripts\Activate.ps1" -ForegroundColor Cyan
