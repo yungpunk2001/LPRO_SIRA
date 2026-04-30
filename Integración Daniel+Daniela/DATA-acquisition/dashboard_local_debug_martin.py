@@ -175,7 +175,6 @@ MAX_BUFFER = max(
     N_FFT_VISUAL,
 )
 MICRO_CHUNK_SAMP = int(0.025 * SR)
-DETECTION_TICK_SAMP = MICRO_CHUNK_SAMP
 
 
 # =========================================================
@@ -243,6 +242,11 @@ print(">>> [4/4] Dashboard configurado.")
 data_lock = threading.Lock()
 ui_lock = threading.Lock()
 stop_event = threading.Event()
+for state in detection_states:
+    state['runtime_lock'] = threading.Lock()
+    state['last_result'] = None
+    state['last_result_time'] = None
+    state['last_processed_samples'] = 0
 
 buffer_audio = np.zeros((MAX_BUFFER, INPUT_CHANNELS), dtype=np.float32)
 doa_pending_audio = np.empty((0, INPUT_CHANNELS), dtype=np.float32)
@@ -251,7 +255,6 @@ DOA_QUEUE_MAX = 4
 
 muestras_totales = 0
 procesado_visual = 0
-procesado_deteccion = 0
 procesado_votacion = 0
 t_interno = 0.0
 t_doa = 0.0
@@ -297,6 +300,107 @@ def resumen_votacion(detalle_votacion: str) -> str:
     return detalle_votacion
 
 
+def select_result_from_period_results(state, period_results):
+    if not period_results:
+        last_result = state.get('last_result')
+        if last_result is None:
+            return {
+                'probability': None,
+                'positive': False,
+                'raw_positive': False,
+                'label': 'pending',
+                'raw_label': 'pending',
+                'positive_streak_s': state.get('positive_streak_s', 0.0),
+                'required_positive_s': state['required_positive_s'],
+                'stale': True,
+            }
+        stale_result = dict(last_result)
+        stale_result['positive'] = False
+        stale_result['label'] = 'background'
+        stale_result['stale'] = True
+        return stale_result
+
+    qualified_results = [
+        result for result in period_results
+        if result.get('positive', False)
+    ]
+    numeric_qualified_results = [
+        result for result in qualified_results
+        if result.get('probability') is not None
+    ]
+    if numeric_qualified_results:
+        selected = max(numeric_qualified_results, key=lambda item: item['probability'])
+    elif qualified_results:
+        selected = max(
+            qualified_results,
+            key=lambda item: item.get('positive_streak_s', 0.0),
+        )
+    else:
+        numeric_results = [
+            result for result in period_results
+            if result.get('probability') is not None
+        ]
+        if numeric_results:
+            selected = max(numeric_results, key=lambda item: item['probability'])
+        else:
+            selected = max(
+                period_results,
+                key=lambda item: item.get('positive_streak_s', 0.0),
+            )
+
+    selected = dict(selected)
+    selected['stale'] = False
+    return selected
+
+
+def format_dashboard_vote_part(state, result):
+    text = detection_manager.format_vote_part(state, result)
+    if result.get('stale'):
+        return f"{text}~"
+    return text
+
+
+def vote_available_detection_models():
+    positive_votes = 0
+    positive_probs = []
+    binary_positive_votes = 0
+    detail_parts = []
+    max_latency_ms = 0.0
+
+    for state in detection_states:
+        with state['runtime_lock']:
+            period_results = list(state['period_results'])
+            state['period_results'].clear()
+            latency_ms = float(state['period_latency_ms'])
+            state['period_latency_ms'] = 0.0
+            result = select_result_from_period_results(state, period_results)
+
+        if result['positive']:
+            positive_votes += 1
+            if result.get('probability') is not None:
+                positive_probs.append(float(result['probability']))
+            else:
+                binary_positive_votes += 1
+
+        detail_parts.append(format_dashboard_vote_part(state, result))
+        max_latency_ms = max(max_latency_ms, latency_ms)
+
+    total_models = len(detection_states)
+    final_detection = positive_votes * 2 >= total_models
+    final_probability = (
+        float(sum(positive_probs) / len(positive_probs))
+        if positive_probs
+        else (1.0 if binary_positive_votes else 0.0)
+    )
+    detail = " | ".join(detail_parts)
+    detail = (
+        f"{detail} => votos {positive_votes}/{total_models} => "
+        f"{'SIRENA' if final_detection else 'Ruido'} "
+        f"(prob+ media={final_probability*100:.1f}%)"
+    )
+    return final_detection, final_probability, max_latency_ms, detail
+
+
 # =========================================================
 # 4. HILOS DE EJECUCION
 # =========================================================
@@ -335,9 +439,9 @@ def hilo_captura():
             time.sleep(0.01)
 
 
-def hilo_doa_y_visuales():
-    global procesado_visual, t_doa
-    global ui_wave, ui_angulos, ui_P_music, ui_theta_scan, ui_fft_y, ui_spec
+def hilo_visuales():
+    global procesado_visual
+    global ui_wave, ui_fft_y, ui_spec
     global hist_discarded_t, hist_discarded_ang
     global hist_low_t, hist_low_ang, hist_max_t, hist_max_ang
     global hist_track_t, hist_track_ang
@@ -367,6 +471,19 @@ def hilo_doa_y_visuales():
             except Exception as exc:
                 print(f"[VISUAL] Error FFT: {exc}")
 
+        if not trabajo:
+            time.sleep(0.005)
+
+
+def hilo_doa():
+    global t_doa
+    global ui_angulos, ui_P_music, ui_theta_scan
+    global hist_discarded_t, hist_discarded_ang
+    global hist_low_t, hist_low_ang, hist_max_t, hist_max_ang
+    global hist_track_t, hist_track_ang
+
+    while not stop_event.is_set():
+        trabajo = False
         doa_frame = pop_doa_frame() if DOA_AVAILABLE else None
         if doa_frame is not None:
             trabajo = True
@@ -428,37 +545,44 @@ def hilo_doa_y_visuales():
             time.sleep(0.005)
 
 
-def hilo_deteccion():
-    global procesado_deteccion, procesado_votacion
+def hilo_modelo_deteccion(state):
+    while not stop_event.is_set():
+        _, total_muestras, _ = snapshot_audio()
+        if total_muestras - state['last_processed_samples'] >= state['step_samp']:
+            state['last_processed_samples'] = total_muestras
+            audio_local, _, _ = snapshot_audio()
+            try:
+                t_inicio = time.time()
+                result = detection_manager.run_detection_state(
+                    state,
+                    audio_local,
+                    audio_channel=DETECTION_CHANNEL,
+                )
+                latency_ms = (time.time() - t_inicio) * 1000
+                with state['runtime_lock']:
+                    state['period_latency_ms'] += latency_ms
+                    state['period_results'].append(result)
+                    state['last_result'] = dict(result)
+                    state['last_result_time'] = time.time()
+            except Exception as exc:
+                print(f"[DETECCION:{state['name']}] Error: {exc}")
+                time.sleep(0.05)
+        else:
+            time.sleep(0.005)
+
+
+def hilo_votacion():
+    global procesado_votacion
     global ui_prob, ui_sirena, ui_detalle
 
     while not stop_event.is_set():
         _, total_muestras, _ = snapshot_audio()
         trabajo = False
 
-        while total_muestras - procesado_deteccion >= DETECTION_TICK_SAMP:
-            procesado_deteccion += DETECTION_TICK_SAMP
-            audio_local, _, _ = snapshot_audio()
-            try:
-                detection_manager.update_detection_models(
-                    detection_states,
-                    audio_local,
-                    DETECTION_TICK_SAMP,
-                    audio_channel=DETECTION_CHANNEL,
-                )
-            except Exception as exc:
-                print(f"[DETECCION] Error actualizando modelos: {exc}")
-            trabajo = True
-
         if total_muestras - procesado_votacion >= VOTE_STEP_SAMP:
-            procesado_votacion += VOTE_STEP_SAMP
-            audio_local, _, _ = snapshot_audio()
+            procesado_votacion = total_muestras
             try:
-                sirena, prob, latencia_ms, detalle = detection_manager.vote_detection_models(
-                    detection_states,
-                    audio_local,
-                    audio_channel=DETECTION_CHANNEL,
-                )
+                sirena, prob, latencia_ms, detalle = vote_available_detection_models()
                 resumen = resumen_votacion(detalle)
                 with ui_lock:
                     ui_sirena = bool(sirena)
@@ -474,8 +598,16 @@ def hilo_deteccion():
 
 
 threading.Thread(target=hilo_captura, daemon=True).start()
-threading.Thread(target=hilo_doa_y_visuales, daemon=True).start()
-threading.Thread(target=hilo_deteccion, daemon=True).start()
+threading.Thread(target=hilo_visuales, daemon=True).start()
+threading.Thread(target=hilo_doa, daemon=True).start()
+for detection_state in detection_states:
+    threading.Thread(
+        target=hilo_modelo_deteccion,
+        args=(detection_state,),
+        daemon=True,
+        name=f"det-{detection_state['name']}",
+    ).start()
+threading.Thread(target=hilo_votacion, daemon=True).start()
 
 
 # =========================================================
