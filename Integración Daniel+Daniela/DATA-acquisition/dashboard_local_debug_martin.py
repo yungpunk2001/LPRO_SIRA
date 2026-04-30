@@ -47,6 +47,116 @@ else:
         + ", ".join(f"{value:.3f}s" for value in required_positive_values)
     )
 
+
+def list_input_devices(audio_interface):
+    devices = []
+    for index in range(audio_interface.get_device_count()):
+        info = audio_interface.get_device_info_by_index(index)
+        max_channels = int(info.get('maxInputChannels', 0))
+        if max_channels > 0:
+            devices.append((index, info, max_channels))
+    return devices
+
+
+def choose_input_device_dialog(input_devices):
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception as exc:
+        print(f"[AUDIO] No se pudo abrir dialogo grafico: {exc}")
+        return choose_input_device_console(input_devices)
+
+    selected = {'device': None}
+    labels = [
+        f"ID {index}: {info['name']} ({channels} canales)"
+        for index, info, channels in input_devices
+    ]
+
+    def accept_selection():
+        selection = listbox.curselection()
+        if not selection:
+            messagebox.showwarning(
+                "Seleccion de microfono",
+                "Selecciona un microfono de entrada.",
+            )
+            return
+        selected['device'] = input_devices[int(selection[0])]
+        root.destroy()
+
+    def cancel_selection():
+        root.destroy()
+
+    root = tk.Tk()
+    root.title("Seleccionar microfono")
+    root.geometry("680x320")
+    root.resizable(True, True)
+    root.protocol("WM_DELETE_WINDOW", cancel_selection)
+
+    label = tk.Label(
+        root,
+        text=(
+            "No se encontro ReSpeaker. "
+            "Selecciona otro microfono para depuracion local."
+        ),
+        anchor="w",
+    )
+    label.pack(fill="x", padx=12, pady=(12, 6))
+
+    frame = tk.Frame(root)
+    frame.pack(fill="both", expand=True, padx=12, pady=6)
+
+    scrollbar = tk.Scrollbar(frame)
+    scrollbar.pack(side="right", fill="y")
+
+    listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set)
+    listbox.pack(side="left", fill="both", expand=True)
+    scrollbar.config(command=listbox.yview)
+
+    for label_text in labels:
+        listbox.insert(tk.END, label_text)
+    if labels:
+        listbox.selection_set(0)
+
+    buttons = tk.Frame(root)
+    buttons.pack(fill="x", padx=12, pady=(6, 12))
+    tk.Button(buttons, text="Usar microfono", command=accept_selection).pack(
+        side="right",
+        padx=(6, 0),
+    )
+    tk.Button(buttons, text="Cancelar", command=cancel_selection).pack(side="right")
+
+    root.mainloop()
+    return selected['device']
+
+
+def choose_input_device_console(input_devices):
+    print("\nMicrofonos de entrada disponibles:")
+    for option, (index, info, channels) in enumerate(input_devices, start=1):
+        print(f"  {option}. ID {index}: {info['name']} ({channels} canales)")
+    try:
+        choice = int(input("Selecciona microfono para depuracion local: ").strip())
+    except Exception:
+        return None
+    if choice < 1 or choice > len(input_devices):
+        return None
+    return input_devices[choice - 1]
+
+
+def choose_input_device(audio_interface):
+    input_devices = list_input_devices(audio_interface)
+    if not input_devices:
+        return None
+
+    for device in input_devices:
+        index, info, _channels = device
+        if "ReSpeaker" in info['name']:
+            print(f"    ReSpeaker detectado en ID {index}: {info['name']}")
+            return device
+
+    print("    ReSpeaker no detectado. Abriendo selector de microfonos...")
+    return choose_input_device_dialog(input_devices)
+
+
 DOA_WINDOW_SEC = cdoa.AUDIO['t_frame']
 DOA_WINDOW_SAMP = int(DOA_WINDOW_SEC * SR)
 DOA_STEP_SAMP = DOA_WINDOW_SAMP
@@ -83,22 +193,32 @@ micpos = np.column_stack(
 
 print(">>> [3/4] Configurando PyAudio...")
 audio = pyaudio.PyAudio()
-dev_index = -1
-for i in range(audio.get_device_count()):
-    info = audio.get_device_info_by_index(i)
-    if "ReSpeaker" in info['name'] and info['maxInputChannels'] > 0:
-        dev_index = i
-        print(f"    ReSpeaker detectado en ID {i}: {info['name']}")
-        break
-
-if dev_index == -1:
-    print("\nERROR: ReSpeaker no encontrado.")
+selected_device = choose_input_device(audio)
+if selected_device is None:
+    print("\nERROR: No se selecciono ningun microfono de entrada.")
     audio.terminate()
     exit()
 
+dev_index, dev_info, dev_max_channels = selected_device
+INPUT_CHANNELS = max(1, min(cdoa.AUDIO['channels_hw'], int(dev_max_channels)))
+DOA_AVAILABLE = INPUT_CHANNELS >= 4
+if DOA_AVAILABLE:
+    if INPUT_CHANNELS >= 5:
+        DOA_CHANNEL_SLICE = slice(1, 5)
+        print("    DoA activo usando canales 1:5.")
+    else:
+        DOA_CHANNEL_SLICE = slice(0, 4)
+        print("    DoA activo usando canales 0:4.")
+else:
+    DOA_CHANNEL_SLICE = None
+    print(
+        "    DoA desactivado: el microfono seleccionado tiene "
+        f"{INPUT_CHANNELS} canal(es)."
+    )
+
 stream = audio.open(
     format=pyaudio.paInt16,
-    channels=cdoa.AUDIO['channels_hw'],
+    channels=INPUT_CHANNELS,
     rate=SR,
     input=True,
     input_device_index=dev_index,
@@ -118,7 +238,7 @@ data_lock = threading.Lock()
 ui_lock = threading.Lock()
 stop_event = threading.Event()
 
-buffer_audio = np.zeros((MAX_BUFFER, cdoa.AUDIO['channels_hw']), dtype=np.float32)
+buffer_audio = np.zeros((MAX_BUFFER, INPUT_CHANNELS), dtype=np.float32)
 
 muestras_totales = 0
 procesado_doa = 0
@@ -172,7 +292,7 @@ def hilo_captura():
             data = stream.read(MICRO_CHUNK_SAMP, exception_on_overflow=False)
             nuevo_bloque = (
                 np.frombuffer(data, dtype=np.int16)
-                .reshape(-1, cdoa.AUDIO['channels_hw'])
+                .reshape(-1, INPUT_CHANNELS)
                 .astype(np.float32)
                 / 32768.0
             )
@@ -223,9 +343,18 @@ def hilo_doa_y_visuales():
         if total_muestras - procesado_doa >= DOA_STEP_SAMP:
             procesado_doa += DOA_STEP_SAMP
             trabajo = True
+            if not DOA_AVAILABLE:
+                tracker.actualizar([], [])
+                with ui_lock:
+                    ui_P_music = np.zeros_like(ui_P_music)
+                    ui_angulos = []
+                continue
+
             audio_local, _, t_actual = snapshot_audio()
             try:
-                mics_raw = audio_local[-DOA_WINDOW_SAMP:, 1:5].astype(np.float64)
+                mics_raw = audio_local[-DOA_WINDOW_SAMP:, DOA_CHANNEL_SLICE].astype(
+                    np.float64
+                )
                 mics_norm = mics_raw - np.mean(mics_raw, axis=0)
                 mics_norm = mics_norm / (
                     np.max(np.abs(mics_norm), axis=0) + np.finfo(float).eps
