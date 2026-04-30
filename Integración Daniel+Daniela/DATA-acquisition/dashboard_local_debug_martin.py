@@ -200,7 +200,12 @@ if selected_device is None:
     exit()
 
 dev_index, dev_info, dev_max_channels = selected_device
+IS_RESPEAKER = "ReSpeaker" in dev_info['name']
 INPUT_CHANNELS = max(1, min(cdoa.AUDIO['channels_hw'], int(dev_max_channels)))
+DETECTION_CHANNEL = detection_manager.resolve_detection_channel(
+    INPUT_CHANNELS,
+    is_respeaker=IS_RESPEAKER,
+)
 DOA_AVAILABLE = INPUT_CHANNELS >= 4
 if DOA_AVAILABLE:
     if INPUT_CHANNELS >= 5:
@@ -215,6 +220,7 @@ else:
         "    DoA desactivado: el microfono seleccionado tiene "
         f"{INPUT_CHANNELS} canal(es)."
     )
+print(f"    Canal deteccion: {DETECTION_CHANNEL}")
 
 stream = audio.open(
     format=pyaudio.paInt16,
@@ -239,13 +245,16 @@ ui_lock = threading.Lock()
 stop_event = threading.Event()
 
 buffer_audio = np.zeros((MAX_BUFFER, INPUT_CHANNELS), dtype=np.float32)
+doa_pending_audio = np.empty((0, INPUT_CHANNELS), dtype=np.float32)
+doa_frame_queue = []
+DOA_QUEUE_MAX = 4
 
 muestras_totales = 0
-procesado_doa = 0
 procesado_visual = 0
 procesado_deteccion = 0
 procesado_votacion = 0
 t_interno = 0.0
+t_doa = 0.0
 
 ui_wave = np.zeros(int(SR / 10), dtype=np.float32)
 ui_angulos = []
@@ -268,6 +277,13 @@ def snapshot_audio():
         return buffer_audio.copy(), muestras_totales, t_interno
 
 
+def pop_doa_frame():
+    with data_lock:
+        if not doa_frame_queue:
+            return None
+        return doa_frame_queue.pop(0)
+
+
 def limpiar_historial(l_t, l_ang, t_actual):
     while len(l_t) > 0 and l_t[0] < t_actual - 20.0:
         l_t.pop(0)
@@ -285,7 +301,8 @@ def resumen_votacion(detalle_votacion: str) -> str:
 # 4. HILOS DE EJECUCION
 # =========================================================
 def hilo_captura():
-    global buffer_audio, muestras_totales, t_interno
+    global buffer_audio, doa_pending_audio, doa_frame_queue
+    global muestras_totales, t_interno
 
     while not stop_event.is_set():
         try:
@@ -301,6 +318,16 @@ def hilo_captura():
             with data_lock:
                 buffer_audio = np.roll(buffer_audio, -n_nuevos, axis=0)
                 buffer_audio[-n_nuevos:, :] = nuevo_bloque
+
+                if DOA_AVAILABLE:
+                    doa_pending_audio = np.vstack((doa_pending_audio, nuevo_bloque))
+                    while len(doa_pending_audio) >= DOA_WINDOW_SAMP:
+                        doa_frame = doa_pending_audio[:DOA_WINDOW_SAMP, :].copy()
+                        doa_pending_audio = doa_pending_audio[DOA_WINDOW_SAMP:, :]
+                        doa_frame_queue.append(doa_frame)
+                    if len(doa_frame_queue) > DOA_QUEUE_MAX:
+                        doa_frame_queue = doa_frame_queue[-DOA_QUEUE_MAX:]
+
                 muestras_totales += n_nuevos
                 t_interno += n_nuevos / SR
         except Exception as exc:
@@ -309,7 +336,7 @@ def hilo_captura():
 
 
 def hilo_doa_y_visuales():
-    global procesado_doa, procesado_visual
+    global procesado_visual, t_doa
     global ui_wave, ui_angulos, ui_P_music, ui_theta_scan, ui_fft_y, ui_spec
     global hist_discarded_t, hist_discarded_ang
     global hist_low_t, hist_low_ang, hist_max_t, hist_max_ang
@@ -324,9 +351,9 @@ def hilo_doa_y_visuales():
             trabajo = True
             audio_local, _, _ = snapshot_audio()
             try:
-                wave = audio_local[-int(SR):, 0][::10]
+                wave = audio_local[-int(SR):, DETECTION_CHANNEL][::10]
 
-                chunk_visual = audio_local[-N_FFT_VISUAL:, 0]
+                chunk_visual = audio_local[-N_FFT_VISUAL:, DETECTION_CHANNEL]
                 ventana = np.hanning(len(chunk_visual))
                 fft_complex = np.fft.rfft(chunk_visual * ventana, n=N_FFT_VISUAL)
                 fft_mag = np.abs(fft_complex) / (N_FFT_VISUAL / 2.0)
@@ -340,19 +367,12 @@ def hilo_doa_y_visuales():
             except Exception as exc:
                 print(f"[VISUAL] Error FFT: {exc}")
 
-        if total_muestras - procesado_doa >= DOA_STEP_SAMP:
-            procesado_doa += DOA_STEP_SAMP
+        doa_frame = pop_doa_frame() if DOA_AVAILABLE else None
+        if doa_frame is not None:
             trabajo = True
-            if not DOA_AVAILABLE:
-                tracker.actualizar([], [])
-                with ui_lock:
-                    ui_P_music = np.zeros_like(ui_P_music)
-                    ui_angulos = []
-                continue
-
-            audio_local, _, t_actual = snapshot_audio()
+            t_doa += DOA_WINDOW_SEC
             try:
-                mics_raw = audio_local[-DOA_WINDOW_SAMP:, DOA_CHANNEL_SLICE].astype(
+                mics_raw = doa_frame[:, DOA_CHANNEL_SLICE].astype(
                     np.float64
                 )
                 mics_norm = mics_raw - np.mean(mics_raw, axis=0)
@@ -372,13 +392,13 @@ def hilo_doa_y_visuales():
                         max_conf_idx = int(np.argmax(conf_est))
                         for p, theta in enumerate(theta_est):
                             if conf_est[p] < cdoa.TRACKER['conf_keep']:
-                                hist_discarded_t.append(t_actual)
+                                hist_discarded_t.append(t_doa)
                                 hist_discarded_ang.append(theta)
                             elif p == max_conf_idx:
-                                hist_max_t.append(t_actual)
+                                hist_max_t.append(t_doa)
                                 hist_max_ang.append(theta)
                             else:
-                                hist_low_t.append(t_actual)
+                                hist_low_t.append(t_doa)
                                 hist_low_ang.append(theta)
 
                     if len(ui_angulos) > 0:
@@ -388,19 +408,19 @@ def hilo_doa_y_visuales():
                                 360 - abs(ui_angulos[0] - hist_track_ang[-1]),
                             )
                             if salto > cdoa.TRACKER['gate_deg']:
-                                hist_track_t.append(t_actual - 0.001)
+                                hist_track_t.append(t_doa - 0.001)
                                 hist_track_ang.append(np.nan)
-                        hist_track_t.append(t_actual)
+                        hist_track_t.append(t_doa)
                         hist_track_ang.append(ui_angulos[0])
                     else:
                         if len(hist_track_ang) > 0 and not np.isnan(hist_track_ang[-1]):
-                            hist_track_t.append(t_actual)
+                            hist_track_t.append(t_doa)
                             hist_track_ang.append(np.nan)
 
-                    limpiar_historial(hist_discarded_t, hist_discarded_ang, t_actual)
-                    limpiar_historial(hist_low_t, hist_low_ang, t_actual)
-                    limpiar_historial(hist_max_t, hist_max_ang, t_actual)
-                    limpiar_historial(hist_track_t, hist_track_ang, t_actual)
+                    limpiar_historial(hist_discarded_t, hist_discarded_ang, t_doa)
+                    limpiar_historial(hist_low_t, hist_low_ang, t_doa)
+                    limpiar_historial(hist_max_t, hist_max_ang, t_doa)
+                    limpiar_historial(hist_track_t, hist_track_ang, t_doa)
             except Exception as exc:
                 print(f"[DOA] Error: {exc}")
 
@@ -424,6 +444,7 @@ def hilo_deteccion():
                     detection_states,
                     audio_local,
                     DETECTION_TICK_SAMP,
+                    audio_channel=DETECTION_CHANNEL,
                 )
             except Exception as exc:
                 print(f"[DETECCION] Error actualizando modelos: {exc}")
@@ -436,13 +457,14 @@ def hilo_deteccion():
                 sirena, prob, latencia_ms, detalle = detection_manager.vote_detection_models(
                     detection_states,
                     audio_local,
+                    audio_channel=DETECTION_CHANNEL,
                 )
                 resumen = resumen_votacion(detalle)
                 with ui_lock:
                     ui_sirena = bool(sirena)
                     ui_prob = float(prob)
                     ui_detalle = resumen
-                print(f"[DET] {resumen} | latencia={latencia_ms:.1f} ms")
+                print(f"[DET] {detalle} | latencia={latencia_ms:.1f} ms")
             except Exception as exc:
                 print(f"[DETECCION] Error votando modelos: {exc}")
             trabajo = True
@@ -555,9 +577,6 @@ plt.tight_layout()
 
 def refrescar_pantalla(_frame):
     try:
-        with data_lock:
-            t_actual = t_interno
-
         with ui_lock:
             wave = np.asarray(ui_wave).copy()
             theta_scan = np.asarray(ui_theta_scan).copy()
@@ -568,6 +587,7 @@ def refrescar_pantalla(_frame):
             prob = float(ui_prob)
             sirena = bool(ui_sirena)
             detalle = str(ui_detalle)
+            t_actual = t_doa
             discarded_t = list(hist_discarded_t)
             discarded_ang = list(hist_discarded_ang)
             low_t = list(hist_low_t)

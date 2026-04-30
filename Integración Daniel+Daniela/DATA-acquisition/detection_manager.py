@@ -124,6 +124,34 @@ def required_positive_seconds_for(
     return required_seconds
 
 
+def resolve_detection_channel(input_channels: int, is_respeaker: bool = True) -> int:
+    if input_channels <= 0:
+        raise ValueError(f"input_channels debe ser positivo: {input_channels}")
+
+    config_key = 'respeaker_detection_channel' if is_respeaker else 'fallback_detection_channel'
+    preferred_channel = int(ccnn.MODEL.get(config_key, 4 if is_respeaker else 0))
+    if 0 <= preferred_channel < input_channels:
+        return preferred_channel
+    return 0
+
+
+def detection_audio_channel(audio_buffer: np.ndarray, audio_channel: int) -> int:
+    if audio_buffer.ndim != 2:
+        raise ValueError(
+            "El buffer de audio debe tener forma [muestras, canales], "
+            f"pero tiene shape={audio_buffer.shape}."
+        )
+
+    channel = int(audio_channel)
+    channel_count = int(audio_buffer.shape[1])
+    if channel < 0 or channel >= channel_count:
+        raise ValueError(
+            f"Canal de deteccion invalido: {channel}. "
+            f"El buffer tiene {channel_count} canal(es)."
+        )
+    return channel
+
+
 def build_detection_state(
     *,
     kind: str,
@@ -251,8 +279,13 @@ def validate_detection_states(detection_states: list[dict]) -> float:
     return max_vote_window_sec
 
 
-def infer_cnn_state(state: dict, audio_buffer: np.ndarray) -> dict:
-    chunk_cnn = audio_buffer[-state['window_samp']:, 0].astype(np.float32)
+def infer_cnn_state(
+    state: dict,
+    audio_buffer: np.ndarray,
+    audio_channel: int = 0,
+) -> dict:
+    channel = detection_audio_channel(audio_buffer, audio_channel)
+    chunk_cnn = audio_buffer[-state['window_samp']:, channel].astype(np.float32)
     runtime_config = state['config']
     chunk_modelo = cnn_runtime.resample_and_pad(
         chunk_cnn,
@@ -273,8 +306,13 @@ def infer_cnn_state(state: dict, audio_buffer: np.ndarray) -> dict:
     }
 
 
-def infer_traditional_state(state: dict, audio_buffer: np.ndarray) -> dict:
-    chunk_trad = audio_buffer[-state['window_samp']:, 0].astype(np.float32)
+def infer_traditional_state(
+    state: dict,
+    audio_buffer: np.ndarray,
+    audio_channel: int = 0,
+) -> dict:
+    channel = detection_audio_channel(audio_buffer, audio_channel)
+    chunk_trad = audio_buffer[-state['window_samp']:, channel].astype(np.float32)
     runtime_config = state['config']
     chunk_modelo = cnn_runtime.resample_and_pad(
         chunk_trad,
@@ -293,11 +331,15 @@ def infer_traditional_state(state: dict, audio_buffer: np.ndarray) -> dict:
     )
 
 
-def infer_detection_state(state: dict, audio_buffer: np.ndarray) -> dict:
+def infer_detection_state(
+    state: dict,
+    audio_buffer: np.ndarray,
+    audio_channel: int = 0,
+) -> dict:
     if state['kind'] == 'cnn':
-        return infer_cnn_state(state, audio_buffer)
+        return infer_cnn_state(state, audio_buffer, audio_channel)
     if state['kind'] == 'traditional':
-        return infer_traditional_state(state, audio_buffer)
+        return infer_traditional_state(state, audio_buffer, audio_channel)
     raise ValueError(f"Tipo de modelo de deteccion no soportado: {state['kind']}")
 
 
@@ -326,29 +368,41 @@ def apply_positive_streak(state: dict, result: dict) -> dict:
     return qualified_result
 
 
-def run_detection_state(state: dict, audio_buffer: np.ndarray) -> dict:
-    return apply_positive_streak(state, infer_detection_state(state, audio_buffer))
+def run_detection_state(
+    state: dict,
+    audio_buffer: np.ndarray,
+    audio_channel: int = 0,
+) -> dict:
+    return apply_positive_streak(
+        state,
+        infer_detection_state(state, audio_buffer, audio_channel),
+    )
 
 
 def update_detection_models(
     detection_states: list[dict],
     audio_buffer: np.ndarray,
     n_samples: int,
+    audio_channel: int = 0,
 ) -> None:
     for state in detection_states:
         state['accumulator'] += n_samples
         if state['accumulator'] >= state['step_samp']:
             state['accumulator'] -= state['step_samp']
             t_inicio = time.time()
-            result = run_detection_state(state, audio_buffer)
+            result = run_detection_state(state, audio_buffer, audio_channel)
             state['period_latency_ms'] += (time.time() - t_inicio) * 1000
             state['period_results'].append(result)
 
 
-def select_period_result(state: dict, audio_buffer: np.ndarray) -> dict:
+def select_period_result(
+    state: dict,
+    audio_buffer: np.ndarray,
+    audio_channel: int = 0,
+) -> dict:
     if not state['period_results']:
         t_inicio = time.time()
-        result = run_detection_state(state, audio_buffer)
+        result = run_detection_state(state, audio_buffer, audio_channel)
         state['period_latency_ms'] += (time.time() - t_inicio) * 1000
         state['period_results'].append(result)
 
@@ -396,6 +450,7 @@ def format_vote_part(state: dict, result: dict) -> str:
 def vote_detection_models(
     detection_states: list[dict],
     audio_buffer: np.ndarray,
+    audio_channel: int = 0,
 ) -> tuple[bool, float, float, str]:
     positive_votes = 0
     positive_probs = []
@@ -404,7 +459,7 @@ def vote_detection_models(
     total_latency_ms = 0.0
 
     for state in detection_states:
-        result = select_period_result(state, audio_buffer)
+        result = select_period_result(state, audio_buffer, audio_channel)
         if result['positive']:
             positive_votes += 1
             if result.get('probability') is not None:

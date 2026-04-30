@@ -76,6 +76,10 @@ DOA_STEP_SAMP = DOA_WINDOW_SAMP
 MAX_DETECTION_WINDOW_SAMP = max(state['window_samp'] for state in detection_states)
 MAX_BUFFER = max(MAX_DETECTION_WINDOW_SAMP, DOA_WINDOW_SAMP, VOTE_STEP_SAMP)
 MICRO_CHUNK_SAMP = int(0.025 * SR)  # Leemos el ReSpeaker en trozos de 25ms
+DETECTION_CHANNEL = detection_manager.resolve_detection_channel(
+    cdoa.AUDIO['channels_hw'],
+    is_respeaker=True,
+)
 
 # =========================================================
 # INICIALIZACION DE MODELOS DOA
@@ -115,6 +119,7 @@ stream = audio.open(format=pyaudio.paInt16,
 print(">>> [4/4] Sistema configurado.")
 print(f"    - Tasa DoA dinamica: {DOA_WINDOW_SEC*1000:.0f} ms ({1/DOA_WINDOW_SEC:.1f} Hz)")
 print(f"    - Ventana votacion deteccion: {VOTE_WINDOW_SEC*1000:.0f} ms ({1/VOTE_WINDOW_SEC:.1f} Hz)")
+print(f"    - Canal deteccion: {DETECTION_CHANNEL}")
 
 
 # --- FUNCIONES DE RED ---
@@ -154,7 +159,12 @@ try:
         buffer_audio = np.roll(buffer_audio, -n_nuevos, axis=0)
         buffer_audio[-n_nuevos:, :] = nuevo_bloque_float
 
-        detection_manager.update_detection_models(detection_states, buffer_audio, n_nuevos)
+        detection_manager.update_detection_models(
+            detection_states,
+            buffer_audio,
+            n_nuevos,
+            audio_channel=DETECTION_CHANNEL,
+        )
         acumulador_votacion += n_nuevos
         acumulador_doa += n_nuevos
 
@@ -198,6 +208,7 @@ try:
             estado_sirena, probabilidad_actual, latencia_ms, detalle_votacion = detection_manager.vote_detection_models(
                 detection_states,
                 buffer_audio,
+                audio_channel=DETECTION_CHANNEL,
             )
 
             enviar_post_async("/update_deteccion", {
@@ -209,7 +220,7 @@ try:
                 "t0_captura": float(t0_captura)
             })
 
-            chunk_ui = buffer_audio[-VOTE_STEP_SAMP:, 0].astype(np.float32)
+            chunk_ui = buffer_audio[-VOTE_STEP_SAMP:, DETECTION_CHANNEL].astype(np.float32)
             salto_onda = max(1, int(len(chunk_ui) / 80))
             onda_ui = [float(x) for x in chunk_ui[::salto_onda]][:80]
 

@@ -17,6 +17,14 @@ MODEL = {
     # ==========================================================
     # AJUSTES MANUALES DE INFERENCIA
     # ==========================================================
+    # Canal usado para deteccion cuando el dispositivo es ReSpeaker.
+    # Se usa indice Python 0-based; canal 4 corresponde al quinto canal de
+    # la matriz capturada por PyAudio y es uno de los micros en bruto.
+    'respeaker_detection_channel': 4,
+
+    # Canal usado para deteccion cuando se escoge otro microfono.
+    'fallback_detection_channel': 0,
+
     # Umbrales manuales individuales para CNN y clasificadores tradicionales.
     # Si un modelo no aparece aqui, usa el umbral guardado en su JSON/bundle.
     #
